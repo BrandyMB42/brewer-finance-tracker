@@ -1,13 +1,21 @@
 name: PR Checks
 
+# Job names below are intentionally `lint-and-test`, `security-check`, and
+# `semgrep` so they match the required status check contexts enforced by the
+# `main` repository ruleset (Settings > Rules > Rulesets). Renaming a job here
+# without updating the ruleset (or vice versa) will block merges.
+
 on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened]
 
 jobs:
-  lint:
-    name: Lint (ruff)
+  # ---------------------------------------------------------------------------
+  # lint-and-test — ruff lint, mypy strict, pytest with >= 80% coverage.
+  # ---------------------------------------------------------------------------
+  lint-and-test:
+    name: lint-and-test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,23 +23,49 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - run: pip install ruff
-      - run: ruff check src tests
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Lint (ruff)
+        run: ruff check src tests
+      - name: Type check (mypy)
+        run: mypy src
+      - name: Tests (pytest + coverage)
+        run: pytest tests/ --cov=src --cov-fail-under=80
 
-  type-check:
-    name: Type Check (mypy)
+  # ---------------------------------------------------------------------------
+  # security-check — dependency vulnerability audit (pip-audit) plus a verified
+  # secret scan of the checked-out tree (TruffleHog).
+  # ---------------------------------------------------------------------------
+  security-check:
+    name: security-check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
-      - run: pip install -e ".[dev]"
-      - run: mypy src
+      - name: Dependency audit (pip-audit)
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit -r requirements.txt
+      - name: Secret scan (TruffleHog)
+        # Filesystem scan of the working tree. --only-verified means the job
+        # fails only on secrets confirmed live; --fail sets a non-zero exit.
+        run: |
+          docker run --rm -v "$PWD:/repo" trufflesecurity/trufflehog:latest \
+            filesystem /repo --only-verified --fail
 
-  test:
-    name: Tests (pytest)
+  # ---------------------------------------------------------------------------
+  # semgrep — static analysis (SAST) using the community Python and secrets
+  # rule packs. --error makes any finding fail the job.
+  # ---------------------------------------------------------------------------
+  semgrep:
+    name: semgrep
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -39,5 +73,7 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - run: pip install -e ".[dev]"
-      - run: pytest tests/ --cov=src --cov-fail-under=80
+      - name: Install semgrep
+        run: python -m pip install --upgrade pip semgrep
+      - name: Run semgrep
+        run: semgrep scan --config p/python --config p/secrets --error src
