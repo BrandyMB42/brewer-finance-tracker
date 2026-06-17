@@ -10,7 +10,7 @@ set -euo pipefail
 
 PROJECT_ID="${1:?Usage: setup.sh <GCP_PROJECT_ID> [REGION]}"
 REGION="${2:-us-central1}"
-SA_NAME="brewer-finance-tracker-sa"
+SA_NAME="finance-tracker-sa"
 SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 REPO_NAME="brewer-finance-tracker"
 

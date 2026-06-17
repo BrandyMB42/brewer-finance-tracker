@@ -1,0 +1,131 @@
+# =============================================================================
+# PR Validation Pipeline
+# -----------------------------------------------------------------------------
+# Triggers on every pull request targeting `main`.
+# Gate 1: lint + tests (>= 80% coverage). Gate 2: secret scan of the PR diff.
+# Import into Harness: Pipelines > New Pipeline > Import From Git (or paste YAML).
+# =============================================================================
+pipeline:
+  name: PR Validation
+  identifier: pr_validation
+  projectIdentifier: brewer_finance_tracker
+  orgIdentifier: default
+  # CI pipelines need an infrastructure to run on. Harness Cloud is the
+  # zero-setup option; swap for a Kubernetes/Docker delegate if self-hosting.
+  properties:
+    ci:
+      codebase:
+        # `github_connector` is the GitHub connector created during setup
+        # (see README > Connectors). It provides repo access + PR status checks.
+        connectorRef: github_connector
+        repoName: brewer-finance-tracker
+        build: <+input>
+
+  stages:
+    # -------------------------------------------------------------------------
+    # Stage 1 — Lint and Test
+    # Runs ruff and pytest in a Python 3.14 container. The pytest step inherits
+    # `--cov-fail-under=80` from pyproject.toml, so coverage < 80% fails the run.
+    # -------------------------------------------------------------------------
+    - stage:
+        name: Lint and Test
+        identifier: lint_and_test
+        type: CI
+        spec:
+          cloneCodebase: true
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  name: Install Dependencies
+                  identifier: install_deps
+                  type: Run
+                  spec:
+                    # Single container image reused across the step group.
+                    image: python:3.14-slim
+                    shell: Sh
+                    command: |
+                      python -m pip install --upgrade pip
+                      pip install -e .[dev]
+
+              # ruff and pytest are grouped so they share the same container
+              # filesystem (the editable install from the previous step).
+              - stepGroup:
+                  name: Quality Gates
+                  identifier: quality_gates
+                  steps:
+                    - step:
+                        name: Lint (ruff)
+                        identifier: lint_ruff
+                        type: Run
+                        spec:
+                          image: python:3.14-slim
+                          shell: Sh
+                          command: |
+                            pip install -e .[dev]
+                            ruff check src tests
+                    - step:
+                        name: Test (pytest + coverage)
+                        identifier: test_pytest
+                        type: Run
+                        spec:
+                          image: python:3.14-slim
+                          shell: Sh
+                          # Fails the pipeline on any test failure OR coverage < 80%.
+                          command: |
+                            pip install -e .[dev]
+                            pytest tests/ --cov=src --cov-fail-under=80 --junitxml=report.xml
+                        # Surface results in the Harness Tests tab.
+                        reports:
+                          type: JUnit
+                          spec:
+                            paths:
+                              - report.xml
+
+    # -------------------------------------------------------------------------
+    # Stage 2 — Security Scan
+    # TruffleHog scans the PR diff for leaked secrets. `--only-verified` means
+    # the step fails only on secrets confirmed live, avoiding false positives.
+    # -------------------------------------------------------------------------
+    - stage:
+        name: Security Scan
+        identifier: security_scan
+        type: CI
+        spec:
+          cloneCodebase: true
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  name: TruffleHog Secret Scan
+                  identifier: trufflehog_scan
+                  type: Run
+                  spec:
+                    image: trufflesecurity/trufflehog:latest
+                    shell: Sh
+                    # Scan only the commits introduced by this PR (base..HEAD).
+                    # --fail returns a non-zero exit code when findings exist;
+                    # combined with --only-verified, the stage fails only on
+                    # verified, live secrets.
+                    command: |
+                      trufflehog git file://. \
+                        --since-commit <+codebase.baseCommitSha> \
+                        --branch <+codebase.commitSha> \
+                        --only-verified \
+                        --fail
+
+  # ---------------------------------------------------------------------------
+  # Trigger — defined separately in Harness (Triggers tab) but documented here.
+  # Type: Pull Request | Event: PR Opened/Reopened/Updated | Target branch: main
+  # See triggers/pr-validation-trigger.yaml in the README for the full spec.
+  # ---------------------------------------------------------------------------

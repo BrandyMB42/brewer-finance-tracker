@@ -1,0 +1,182 @@
+# =============================================================================
+# Staging Deploy Pipeline
+# -----------------------------------------------------------------------------
+# Triggers on merge (push) to `main`. Re-runs tests, deploys to Cloud Run
+# staging, then smoke-tests the live URL.
+# Secrets are referenced with Harness secret syntax and never inlined.
+# =============================================================================
+pipeline:
+  name: Staging Deploy
+  identifier: staging_deploy
+  projectIdentifier: brewer_finance_tracker
+  orgIdentifier: default
+  properties:
+    ci:
+      codebase:
+        connectorRef: github_connector
+        repoName: brewer-finance-tracker
+        build: <+input>
+
+  stages:
+    # -------------------------------------------------------------------------
+    # Stage 1 — Run Tests
+    # Identical gate to PR validation: a merge must not ship if tests regress.
+    # -------------------------------------------------------------------------
+    - stage:
+        name: Run Tests
+        identifier: run_tests
+        type: CI
+        spec:
+          cloneCodebase: true
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  name: Test (pytest + coverage)
+                  identifier: test_pytest
+                  type: Run
+                  spec:
+                    image: python:3.14-slim
+                    shell: Sh
+                    command: |
+                      python -m pip install --upgrade pip
+                      pip install -e .[dev]
+                      ruff check src tests
+                      pytest tests/ --cov=src --cov-fail-under=80 --junitxml=report.xml
+                  reports:
+                    type: JUnit
+                    spec:
+                      paths:
+                        - report.xml
+
+    # -------------------------------------------------------------------------
+    # Stage 2 — Deploy to Cloud Run Staging
+    # Builds + pushes the image, then `gcloud run deploy`. The runtime service
+    # account (finance-tracker-sa) is what the *app* runs as; it holds
+    # secretAccessor so the app can read secrets at runtime.
+    # -------------------------------------------------------------------------
+    - stage:
+        name: Deploy to Cloud Run Staging
+        identifier: deploy_staging
+        type: CI
+        spec:
+          cloneCodebase: true
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - stepGroup:
+                  name: Build and Deploy
+                  identifier: build_and_deploy
+                  steps:
+                    - step:
+                        name: Authenticate to GCP
+                        identifier: gcp_auth
+                        type: Run
+                        spec:
+                          image: google/cloud-sdk:slim
+                          shell: Sh
+                          # The CI/CD service account key is stored as a Harness
+                          # file/text secret. Written to disk only inside the
+                          # ephemeral build container, then activated.
+                          envVariables:
+                            GCP_SA_KEY: <+secrets.getValue("gcp-cicd-sa-key")>
+                            GCP_PROJECT_ID: <+secrets.getValue("gcp-project-id")>
+                          command: |
+                            echo "$GCP_SA_KEY" > /tmp/key.json
+                            gcloud auth activate-service-account --key-file=/tmp/key.json
+                            gcloud config set project "$GCP_PROJECT_ID"
+                    - step:
+                        name: Build and Push Image
+                        identifier: build_push
+                        type: Run
+                        spec:
+                          image: google/cloud-sdk:slim
+                          shell: Sh
+                          envVariables:
+                            GCP_PROJECT_ID: <+secrets.getValue("gcp-project-id")>
+                          command: |
+                            IMAGE="us-central1-docker.pkg.dev/$GCP_PROJECT_ID/brewer-finance-tracker/app:<+pipeline.sequenceId>"
+                            gcloud builds submit --tag "$IMAGE" .
+                            echo "$IMAGE" > /tmp/image.txt
+                    - step:
+                        name: Deploy Cloud Run (staging)
+                        identifier: gcloud_deploy
+                        type: Run
+                        spec:
+                          image: google/cloud-sdk:slim
+                          shell: Sh
+                          envVariables:
+                            GCP_PROJECT_ID: <+secrets.getValue("gcp-project-id")>
+                          command: |
+                            IMAGE=$(cat /tmp/image.txt)
+                            gcloud run deploy brewer-finance-tracker-staging \
+                              --image "$IMAGE" \
+                              --region us-central1 \
+                              --platform managed \
+                              --service-account finance-tracker-sa@$GCP_PROJECT_ID.iam.gserviceaccount.com \
+                              --set-env-vars ENVIRONMENT=staging,GCP_PROJECT_ID=$GCP_PROJECT_ID \
+                              --allow-unauthenticated \
+                              --quiet
+                            # Capture the deployed URL for the smoke-test stage.
+                            URL=$(gcloud run services describe brewer-finance-tracker-staging \
+                              --region us-central1 --format='value(status.url)')
+                            echo "$URL"
+
+    # -------------------------------------------------------------------------
+    # Stage 3 — Smoke Test
+    # Polls the live /health endpoint for up to 30s; fails if it never returns
+    # 200. Gives Cloud Run a moment to route traffic to the new revision.
+    # -------------------------------------------------------------------------
+    - stage:
+        name: Smoke Test
+        identifier: smoke_test
+        type: CI
+        spec:
+          cloneCodebase: false
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  name: Health Check
+                  identifier: health_check
+                  type: Run
+                  spec:
+                    image: curlimages/curl:8.6.0
+                    shell: Sh
+                    envVariables:
+                      GCP_PROJECT_ID: <+secrets.getValue("gcp-project-id")>
+                    # The staging URL is stable across deploys, so it can be
+                    # stored as a Harness secret/variable rather than threaded
+                    # through stages. Poll for up to 30s (10 tries x 3s).
+                    command: |
+                      STAGING_URL="<+secrets.getValue("staging-service-url")>"
+                      for i in $(seq 1 10); do
+                        CODE=$(curl -s -o /dev/null -w "%{http_code}" "$STAGING_URL/health" || echo 000)
+                        echo "Attempt $i: HTTP $CODE"
+                        if [ "$CODE" = "200" ]; then
+                          echo "Staging healthy."
+                          exit 0
+                        fi
+                        sleep 3
+                      done
+                      echo "Health check failed after 30s"
+                      exit 1
+
+  # ---------------------------------------------------------------------------
+  # Trigger: Type Push | Event: Push to branch | Target branch: main
+  # ---------------------------------------------------------------------------
