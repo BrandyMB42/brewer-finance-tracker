@@ -229,16 +229,20 @@ project specified by `GCP_PROJECT_ID`:
 
 | Secret name | Purpose |
 |-------------|---------|
-| `webhook-signing-secret` | HMAC key used to verify inbound webhook payloads |
+| `plaid-client-id` | Plaid API client ID |
+| `plaid-secret` | Plaid API secret (environment-specific) |
+| `plaid-access-token-<item-label>` | Per-item Plaid access token, created at link time by `plaid_link.exchange_public_token` |
+| `sheets-service-account-json` | Service account key JSON used by `sheets_writer` for the Sheets API |
+| `webhook-signing-secret` | HMAC key used to verify inbound Plaid webhook payloads |
 
-Create secrets with:
-
-```bash
-echo -n "<value>" | gcloud secrets create webhook-signing-secret \
-  --data-file=- \
-  --replication-policy=automatic \
-  --project=<your-gcp-project-id>
-```
+`scripts/setup.sh` creates the static secrets (everything except the
+per-item access tokens) as placeholders and grants the runtime service account
+access. Populate them with real values before the first deploy — see the
+instructions printed at the end of that script.
 
 The Cloud Run service account (`brewer-finance-tracker-sa`) must have
-`roles/secretmanager.secretAccessor` on each secret.
+`roles/secretmanager.secretAccessor` on each secret. The same account also needs
+`roles/secretmanager.secretVersionAdder`/`secretManager.admin` (or a custom role
+granting `secrets.create` + `secrets.versions.add`) so that
+`plaid_link.exchange_public_token` can create per-item access-token secrets at
+runtime.

@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "brewer-finance-tracker"
@@ -10,6 +10,9 @@ requires-python = ">=3.11"
 dependencies = [
     "flask>=3.0",
     "google-cloud-secret-manager>=2.20",
+    "plaid-python>=18.0",
+    "gspread>=6.0",
+    "google-auth>=2.30",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +23,9 @@ dev = [
     "ruff>=0.4",
 ]
 
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [tool.ruff]
 target-version = "py311"
 line-length = 100
@@ -27,6 +33,11 @@ line-length = 100
 [tool.mypy]
 python_version = "3.11"
 strict = true
+
+# plaid-python ships no py.typed marker or stubs.
+[[tool.mypy.overrides]]
+module = ["plaid.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
