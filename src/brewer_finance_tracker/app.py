@@ -17,6 +17,7 @@ import logging
 from flask import Flask
 
 from .config import Config
+from .health import health_bp
 from .logging_config import configure_logging
 from .webhook.handler import webhook_bp
 
@@ -41,6 +42,7 @@ def create_app(config: type[Config] = Config) -> Flask:
     app = Flask(__name__)
     app.config.from_object(config)
 
+    app.register_blueprint(health_bp)
     app.register_blueprint(webhook_bp)
 
     logger.info(

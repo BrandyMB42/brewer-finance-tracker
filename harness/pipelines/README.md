@@ -3,6 +3,18 @@
 Three pipelines gate every change from pull request through production.
 They are defined in Harness CI/CD and reference secrets stored in GCP Secret Manager.
 
+The runnable pipeline definitions live alongside this README:
+
+| File | Pipeline | Trigger |
+|------|----------|---------|
+| [`pr-validation.yaml`](./pr-validation.yaml) | PR Validation | Pull request to `main` |
+| [`staging-deploy.yaml`](./staging-deploy.yaml) | Staging Deploy | Push / merge to `main` |
+| [`production-deploy.yaml`](./production-deploy.yaml) | Production Deploy | Manual |
+
+The sections below describe each pipeline conceptually. See
+[Importing into Harness](#importing-into-harness) at the end for step-by-step
+setup of connectors, secrets, and triggers.
+
 ---
 
 ## 1. PR Validation
@@ -117,7 +129,7 @@ stages:
                           --image <region>-docker.pkg.dev/<project>/brewer-finance-tracker:<+pipeline.sequenceId> \
                           --region <region> \
                           --set-env-vars ENVIRONMENT=staging,GCP_PROJECT_ID=<project> \
-                          --service-account brewer-finance-tracker-sa@<project>.iam.gserviceaccount.com \
+                          --service-account finance-tracker-sa@<project>.iam.gserviceaccount.com \
                           --platform managed
 ```
 
@@ -215,7 +227,7 @@ stages:
                           --image <region>-docker.pkg.dev/<project>/brewer-finance-tracker:<+pipeline.sequenceId> \
                           --region <region> \
                           --set-env-vars ENVIRONMENT=production,GCP_PROJECT_ID=<project> \
-                          --service-account brewer-finance-tracker-sa@<project>.iam.gserviceaccount.com \
+                          --service-account finance-tracker-sa@<project>.iam.gserviceaccount.com \
                           --platform managed \
                           --traffic 100
 ```
@@ -240,9 +252,100 @@ per-item access tokens) as placeholders and grants the runtime service account
 access. Populate them with real values before the first deploy — see the
 instructions printed at the end of that script.
 
-The Cloud Run service account (`brewer-finance-tracker-sa`) must have
+The Cloud Run service account (`finance-tracker-sa`) must have
 `roles/secretmanager.secretAccessor` on each secret. The same account also needs
 `roles/secretmanager.secretVersionAdder`/`secretManager.admin` (or a custom role
 granting `secrets.create` + `secrets.versions.add`) so that
 `plaid_link.exchange_public_token` can create per-item access-token secrets at
 runtime.
+
+---
+
+## Importing into Harness
+
+### Prerequisites
+
+1. A Harness account with a **Project** whose identifier matches the YAML:
+   `projectIdentifier: brewer_finance_tracker` under `orgIdentifier: default`.
+   Create these (or edit the identifiers in all three YAML files to match an
+   existing project/org).
+2. The GCP project bootstrapped via `scripts/setup.sh` (APIs enabled, runtime SA
+   and Artifact Registry created, secrets populated).
+3. A separate **CI/CD service account** with permission to build images and
+   deploy Cloud Run. Grant it: `roles/run.admin`, `roles/cloudbuild.builds.editor`,
+   `roles/artifactregistry.writer`, `roles/iam.serviceAccountUser` (to act as the
+   runtime SA), and `roles/resourcemanager.projectIamAdmin` (required only by the
+   production chaos gate, which toggles IAM bindings). Export a JSON key for it.
+
+### Step 1 — Create connectors
+
+| Connector | Identifier | Purpose | Notes |
+|-----------|------------|---------|-------|
+| **GitHub** | `github_connector` | Clone the repo, report PR status checks | Use a GitHub App or a PAT stored as a Harness secret. Enable **API Access** so PR validation can post status checks. |
+| **GCP** | `gcp_connector` | (Optional) native Harness GCP steps | The pipelines authenticate with `gcloud` + a Harness secret key instead, so this is only needed if you switch to Harness-native GCR/Cloud Run steps. |
+
+In Harness: **Project Settings → Connectors → New Connector**. The connector
+identifiers must match `connectorRef` values in the YAML (`github_connector`).
+
+### Step 2 — Create secrets
+
+**Project Settings → Secrets → New Secret** (Text/File). These are Harness
+platform secrets referenced as `<+secrets.getValue("name")>` — distinct from the
+GCP Secret Manager secrets the *application* reads at runtime.
+
+| Harness secret | Type | Value |
+|----------------|------|-------|
+| `gcp-cicd-sa-key` | File or Text | JSON key for the CI/CD service account |
+| `gcp-project-id` | Text | Your GCP project ID |
+| `staging-service-url` | Text | Cloud Run staging URL (fill in after first deploy) |
+| `production-service-url` | Text | Cloud Run production URL (fill in after first prod deploy) |
+
+> The service URLs are unknown until the first deploy. Run staging once, copy the
+> URL Cloud Run prints, then set `staging-service-url` so the smoke-test stage
+> can resolve it on subsequent runs.
+
+### Step 3 — Create the approver user group
+
+The production approval references `finance_release_approvers`. Create it under
+**Account/Project Settings → Access Control → User Groups** with identifier
+`finance_release_approvers` and add the engineers allowed to approve releases.
+
+### Step 4 — Import the pipelines
+
+For each YAML file:
+
+1. **Pipelines → New Pipeline → Import From Git** (if the repo is connected via
+   `github_connector`), pointing at `harness/pipelines/<file>.yaml`; or
+2. **New Pipeline → Inline → YAML view**, then paste the file contents.
+
+Importing from Git is preferred — the pipeline stays version-controlled and
+edits flow through PRs.
+
+### Step 5 — Configure triggers
+
+Triggers are set in the Harness UI (**Pipeline → Triggers**), not in these YAML
+files:
+
+| Pipeline | Trigger type | Configuration |
+|----------|--------------|---------------|
+| PR Validation | **Pull Request** | Connector `github_connector`, events Open/Reopen/Updated, target branch `main` |
+| Staging Deploy | **Push** | Connector `github_connector`, event Push, branch `main` |
+| Production Deploy | *(none)* | Run manually from the UI |
+
+### Step 6 — Wire PR validation as a required check
+
+In GitHub **Settings → Branches → Branch protection rules** for `main`, add the
+Harness PR Validation status check as **required**, so PRs cannot merge until
+lint, tests (≥80% coverage), and the TruffleHog secret scan all pass.
+
+### Notes on the YAML
+
+- All three pipelines run on **Harness Cloud** (`runtime.type: Cloud`) for
+  zero-setup infrastructure. To run on your own Kubernetes/Docker delegate,
+  replace each `runtime` block with the appropriate `infrastructure` spec.
+- Secrets are **always** referenced via `<+secrets.getValue("...")>` and written
+  to disk only inside ephemeral build containers — never committed or echoed in
+  full.
+- The chaos gate restores the revoked IAM binding in a dedicated step so a
+  failed assertion never leaves staging in a broken state; the recovery probe is
+  the hard pass/fail gate for the stage.

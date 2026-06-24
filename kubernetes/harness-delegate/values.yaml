@@ -1,0 +1,39 @@
+# =============================================================================
+# Harness Delegate values
+# -----------------------------------------------------------------------------
+# These values are passed to the `harness-delegate-ng` subchart declared as a
+# dependency in Chart.yaml. They configure a self-hosted delegate that lets the
+# Harness pipelines (see harness/pipelines/) run on our own Kubernetes cluster
+# instead of Harness Cloud.
+#
+# IMPORTANT — the delegate token is NOT a real secret in this file:
+#   `delegateToken` below is a placeholder. The real token is supplied as a
+#   Kubernetes Secret (`harness-delegate-token`) which ArgoCD populates from an
+#   out-of-band source. See ../README.md for the full flow.
+# =============================================================================
+
+# Value consumed by templates/delegate-token-secret.yaml. Left as a placeholder
+# in git; ArgoCD overrides it from a Kubernetes secret at sync time so the real
+# token is never committed.
+delegateTokenValue: HARNESS_DELEGATE_TOKEN_PLACEHOLDER
+
+harness-delegate-ng:
+  delegateName: gcp-delegate
+  accountId: 3sLn7hV4RiSWUTk3M52ciQ
+  managerEndpoint: https://app.harness.io
+  delegateDockerImage: us-docker.pkg.dev/gar-prod-setup/harness-public/harness/delegate:26.06.89303
+  replicas: 1
+
+  # Placeholder — overridden on the cluster by the harness-delegate-token Secret.
+  delegateToken: HARNESS_DELEGATE_TOKEN_PLACEHOLDER
+
+  upgrader:
+    enabled: true
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
