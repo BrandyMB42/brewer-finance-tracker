@@ -40,10 +40,13 @@ helm dependency update kubernetes/harness-delegate
 ## The delegate token
 
 This chart carries **no delegate token** — there is no token value in
-`values.yaml` and no Secret template. The token lives only in a Kubernetes
-Secret named `harness-delegate-token` (key `delegateToken`) that you create
-**manually on the cluster** before the first ArgoCD sync. That Secret is
-intentionally excluded from GitOps management.
+`values.yaml` and no Secret template. Instead, `values.yaml` sets
+`existingDelegateToken: harness-delegate-token`, telling the upstream chart to
+read the token from a Kubernetes Secret named `harness-delegate-token` (data key
+**`DELEGATE_TOKEN`**, fixed by the chart) that you create **manually on the
+cluster** before the first ArgoCD sync. The chart therefore does not create or
+manage its own token Secret. That Secret is intentionally excluded from GitOps
+management.
 
 See [`../README.md`](../README.md#secrets-are-never-stored-in-git) for the exact
 `kubectl create secret` command and the ArgoCD exclusion annotations.

@@ -21,21 +21,27 @@ Secret manifest, not anywhere in this directory. The chart contains **no
 delegate-token value and no token Secret template at all**.
 
 Instead, the token lives only in a Kubernetes Secret named
-`harness-delegate-token` (key `delegateToken`) that you create **manually on the
-cluster, out-of-band, before the first ArgoCD sync**. Get the token from
+`harness-delegate-token` that you create **manually on the cluster, out-of-band,
+before the first ArgoCD sync**. The chart reads it via its `existingDelegateToken`
+value (set in `harness-delegate/values.yaml`), which requires the token to be
+stored under the data key **`DELEGATE_TOKEN`** — that key name is fixed by the
+upstream chart and is not configurable. Get the token from
 **Harness → Account/Project Settings → Delegates → Tokens**, then:
 
 ```bash
 kubectl create namespace harness-delegate-ng --dry-run=client -o yaml | kubectl apply -f -
 
 kubectl create secret generic harness-delegate-token \
-  --from-literal=delegateToken="YOUR_REAL_TOKEN" \
+  --from-literal=DELEGATE_TOKEN="YOUR_REAL_TOKEN" \
   --namespace=harness-delegate-ng
 ```
 
-The delegate reads the token from this Secret at runtime. The plaintext lives
-only in cluster `etcd` (encrypted at rest) — it is never rendered by Helm,
-never tracked by ArgoCD, and never present in any committed manifest.
+The delegate reads the token from this Secret at runtime via
+`existingDelegateToken: harness-delegate-token`. Because we point the chart at an
+existing Secret, it does **not** create or manage its own (empty) token Secret.
+The plaintext lives only in cluster `etcd` (encrypted at rest) — it is never
+rendered by Helm, never tracked by ArgoCD, and never present in any committed
+manifest.
 
 > If you forget to create the Secret before syncing, the delegate pod will fail
 > to authenticate and stay un-Connected. Create the Secret, then let ArgoCD

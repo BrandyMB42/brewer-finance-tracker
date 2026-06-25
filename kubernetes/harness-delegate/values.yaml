@@ -8,10 +8,10 @@
 #
 # IMPORTANT — the delegate token is NOT stored here.
 #   The token is sensitive and must never be committed to git. It lives only in
-#   a Kubernetes Secret named `harness-delegate-token` (key `delegateToken`) that
-#   is created manually on the cluster, out-of-band, before the first ArgoCD
-#   sync. That Secret is intentionally excluded from GitOps management. See
-#   ../README.md for the exact `kubectl create secret` command.
+#   a Kubernetes Secret named `harness-delegate-token` (key `DELEGATE_TOKEN`)
+#   that is created manually on the cluster, out-of-band, before the first
+#   ArgoCD sync. That Secret is intentionally excluded from GitOps management.
+#   See ../README.md for the exact `kubectl create secret` command.
 # =============================================================================
 
 harness-delegate-ng:
@@ -20,6 +20,14 @@ harness-delegate-ng:
   managerEndpoint: https://app.harness.io
   delegateDockerImage: us-docker.pkg.dev/gar-prod-setup/harness-public/harness/delegate:26.06.89303
   replicas: 1
+
+  # Read the delegate token from our manually-managed Secret instead of letting
+  # the chart create and manage its own (empty) gcp-delegate token Secret.
+  # `existingDelegateToken` is the chart's parameter for this; the referenced
+  # Secret MUST expose the token under the key `DELEGATE_TOKEN` (the key name is
+  # fixed by the chart and is not configurable). When set, it takes precedence
+  # over `delegateToken`.
+  existingDelegateToken: harness-delegate-token
 
   upgrader:
     enabled: true
