@@ -29,13 +29,15 @@ harness-delegate-ng:
   # over `delegateToken`.
   existingDelegateToken: harness-delegate-token
 
+  # The delegate image (delegateDockerImage) and chart version are pinned in git
+  # and upgraded via PR, so the in-cluster auto-upgrader is disabled — it would
+  # otherwise change the image out from under ArgoCD (drift) and also needs its
+  # own UPGRADER_TOKEN secret to authenticate.
   upgrader:
-    enabled: true
+    enabled: false
 
-  resources:
-    requests:
-      cpu: 100m
-      memory: 256Mi
-    limits:
-      cpu: 500m
-      memory: 512Mi
+  # NOTE: this chart does not take a Kubernetes-style `resources:` block. It
+  # exposes flat `cpu` and `memory` values (memory is in MiB, as a number) which
+  # it maps to the delegate container's requests/limits.
+  cpu: 0.5
+  memory: 512

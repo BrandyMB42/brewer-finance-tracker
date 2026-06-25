@@ -7,9 +7,12 @@ description: >-
   injected from a Kubernetes Secret created out-of-band — never committed here.
 type: application
 version: 0.1.0
-appVersion: "1.0.0"
+appVersion: "1.0.32"
 
 dependencies:
   - name: harness-delegate-ng
-    version: "1.0.0"
+    # 1.0.32 is the first pinned version we use that supports referencing an
+    # existing token Secret via `existingDelegateToken` (see values.yaml). The
+    # older 1.0.0 ignored that parameter entirely.
+    version: "1.0.32"
     repository: https://app.harness.io/storage/harness-download/delegate-helm-chart/

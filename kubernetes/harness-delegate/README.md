@@ -23,13 +23,16 @@ For the repo-wide GitOps story and the delegate-token security model, see
 ```yaml
 dependencies:
   - name: harness-delegate-ng
-    version: "1.0.0"
+    version: "1.0.32"
     repository: https://app.harness.io/storage/harness-download/delegate-helm-chart/
 ```
 
-This pins the exact upstream version in git, keeps our overrides in one
-reviewable `values.yaml`, and lets ArgoCD render everything with a single chart
-reference. To resolve the dependency locally:
+We pin `1.0.32` because it is the version that supports the
+`existingDelegateToken` parameter we rely on to read the token from an
+out-of-band Secret; the older `1.0.0` ignored it. Pinning keeps the exact
+upstream version in git, keeps our overrides in one reviewable `values.yaml`,
+and lets ArgoCD render everything with a single chart reference. To resolve the
+dependency locally:
 
 ```bash
 helm dependency update kubernetes/harness-delegate
