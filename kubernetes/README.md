@@ -16,44 +16,49 @@ and ArgoCD syncs.
 ## Secrets are never stored in git
 
 The Harness delegate authenticates with a **delegate token**. That token is
-sensitive and is **never committed** — not in `values.yaml`, not in any manifest
-in this directory.
+sensitive and is **never committed** — not in `values.yaml`, not as a templated
+Secret manifest, not anywhere in this directory. The chart contains **no
+delegate-token value and no token Secret template at all**.
 
-What lives in git is only a placeholder. `harness-delegate/values.yaml` sets:
-
-```yaml
-delegateTokenValue: HARNESS_DELEGATE_TOKEN_PLACEHOLDER
-```
-
-and `harness-delegate/templates/delegate-token-secret.yaml` renders that value
-into a Kubernetes Secret:
-
-```yaml
-kind: Secret
-metadata:
-  name: harness-delegate-token
-  namespace: harness-delegate-ng
-stringData:
-  delegateToken: {{ .Values.delegateTokenValue | quote }}
-```
-
-The **real** token is created directly on the cluster, out-of-band, and ArgoCD
-injects it over the placeholder at sync time (via a parameter override or
-`valuesObject` on the Application). Get the token from
-**Harness → Account/Project Settings → Delegates → Tokens**, then create the
-override secret on the cluster:
+Instead, the token lives only in a Kubernetes Secret named
+`harness-delegate-token` (key `delegateToken`) that you create **manually on the
+cluster, out-of-band, before the first ArgoCD sync**. Get the token from
+**Harness → Account/Project Settings → Delegates → Tokens**, then:
 
 ```bash
 kubectl create namespace harness-delegate-ng --dry-run=client -o yaml | kubectl apply -f -
 
-kubectl create secret generic harness-delegate-token-override \
-  --namespace harness-delegate-ng \
-  --from-literal=delegateTokenValue='<paste-token-here>'
+kubectl create secret generic harness-delegate-token \
+  --from-literal=delegateToken="YOUR_REAL_TOKEN" \
+  --namespace=harness-delegate-ng
 ```
 
-Point the ArgoCD Application at that secret so it overrides
-`delegateTokenValue` at render time — the plaintext token lives only in cluster
-`etcd` (encrypted at rest), never in the manifests ArgoCD reads from git.
+The delegate reads the token from this Secret at runtime. The plaintext lives
+only in cluster `etcd` (encrypted at rest) — it is never rendered by Helm,
+never tracked by ArgoCD, and never present in any committed manifest.
+
+> If you forget to create the Secret before syncing, the delegate pod will fail
+> to authenticate and stay un-Connected. Create the Secret, then let ArgoCD
+> re-sync (or restart the delegate deployment).
+
+### This Secret is intentionally excluded from GitOps
+
+Because `harness-delegate-token` holds a live credential, it is **deliberately
+left out of GitOps management**. It is not in git, so ArgoCD has nothing to
+render or reconcile for it. To guarantee ArgoCD never flags or prunes the
+out-of-band Secret, annotate it so ArgoCD ignores it:
+
+```bash
+kubectl annotate secret harness-delegate-token \
+  --namespace=harness-delegate-ng \
+  argocd.argoproj.io/compare-options=IgnoreExtraneous \
+  argocd.argoproj.io/sync-options=Prune=false
+```
+
+- `compare-options: IgnoreExtraneous` — ArgoCD won't report the Secret as
+  out-of-sync just because it isn't in git.
+- `sync-options: Prune=false` — even an automated/pruning sync will never delete
+  it.
 
 > For a fully GitOps-friendly token, manage it with
 > [Sealed Secrets](https://github.com/bitnami-labs/sealed-secrets) or the
@@ -82,10 +87,8 @@ spec:
     helm:
       valueFiles:
         - values.yaml
-      # Override the placeholder with the real token at sync time.
-      parameters:
-        - name: delegateTokenValue
-          value: $ARGOCD_ENV_DELEGATE_TOKEN   # sourced from a cluster secret
+      # No token parameters here — the delegate token is supplied by the
+      # out-of-band `harness-delegate-token` Secret, never by ArgoCD.
   destination:
     server: https://kubernetes.default.svc
     namespace: harness-delegate-ng
@@ -106,5 +109,6 @@ Key points:
 - **`namespace.yaml`** can be applied as its own Application or relied upon via
   `CreateNamespace=true`; either way the `harness-delegate-ng` namespace exists
   before the delegate is deployed.
-- The **real delegate token never enters git** — only the placeholder does, and
-  ArgoCD overrides it from a cluster secret during rendering.
+- The **delegate token never enters git** at all — it exists only as the
+  manually-created `harness-delegate-token` Secret, which is intentionally
+  excluded from GitOps management (see above).

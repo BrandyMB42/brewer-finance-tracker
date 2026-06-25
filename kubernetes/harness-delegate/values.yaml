@@ -6,16 +6,13 @@
 # Harness pipelines (see harness/pipelines/) run on our own Kubernetes cluster
 # instead of Harness Cloud.
 #
-# IMPORTANT — the delegate token is NOT a real secret in this file:
-#   `delegateToken` below is a placeholder. The real token is supplied as a
-#   Kubernetes Secret (`harness-delegate-token`) which ArgoCD populates from an
-#   out-of-band source. See ../README.md for the full flow.
+# IMPORTANT — the delegate token is NOT stored here.
+#   The token is sensitive and must never be committed to git. It lives only in
+#   a Kubernetes Secret named `harness-delegate-token` (key `delegateToken`) that
+#   is created manually on the cluster, out-of-band, before the first ArgoCD
+#   sync. That Secret is intentionally excluded from GitOps management. See
+#   ../README.md for the exact `kubectl create secret` command.
 # =============================================================================
-
-# Value consumed by templates/delegate-token-secret.yaml. Left as a placeholder
-# in git; ArgoCD overrides it from a Kubernetes secret at sync time so the real
-# token is never committed.
-delegateTokenValue: HARNESS_DELEGATE_TOKEN_PLACEHOLDER
 
 harness-delegate-ng:
   delegateName: gcp-delegate
@@ -23,9 +20,6 @@ harness-delegate-ng:
   managerEndpoint: https://app.harness.io
   delegateDockerImage: us-docker.pkg.dev/gar-prod-setup/harness-public/harness/delegate:26.06.89303
   replicas: 1
-
-  # Placeholder — overridden on the cluster by the harness-delegate-token Secret.
-  delegateToken: HARNESS_DELEGATE_TOKEN_PLACEHOLDER
 
   upgrader:
     enabled: true

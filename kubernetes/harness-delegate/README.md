@@ -10,7 +10,6 @@ infrastructure instead of Harness Cloud.
 |------|---------|
 | [`Chart.yaml`](./Chart.yaml) | Declares the official `harness-delegate-ng` chart as a dependency. |
 | [`values.yaml`](./values.yaml) | Our delegate configuration (name, account, image, resources). |
-| [`templates/delegate-token-secret.yaml`](./templates/delegate-token-secret.yaml) | Renders the `harness-delegate-token` Secret from a Helm value. |
 
 For the repo-wide GitOps story and the delegate-token security model, see
 [`../README.md`](../README.md).
@@ -40,14 +39,14 @@ helm dependency update kubernetes/harness-delegate
 
 ## The delegate token
 
-`values.yaml` ships a **placeholder** token (`HARNESS_DELEGATE_TOKEN_PLACEHOLDER`)
-in both the subchart's `delegateToken` and our top-level `delegateTokenValue`.
-The real token is **never committed**. ArgoCD overrides `delegateTokenValue` from
-a Kubernetes secret on the cluster at sync time; `templates/delegate-token-secret.yaml`
-renders that into the `harness-delegate-token` Secret the delegate reads.
+This chart carries **no delegate token** — there is no token value in
+`values.yaml` and no Secret template. The token lives only in a Kubernetes
+Secret named `harness-delegate-token` (key `delegateToken`) that you create
+**manually on the cluster** before the first ArgoCD sync. That Secret is
+intentionally excluded from GitOps management.
 
 See [`../README.md`](../README.md#secrets-are-never-stored-in-git) for the exact
-commands to seed the override secret.
+`kubectl create secret` command and the ArgoCD exclusion annotations.
 
 ---
 
