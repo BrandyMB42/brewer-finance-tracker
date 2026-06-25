@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Helm chart dependency build artifacts (resolved subchart tarballs)
+kubernetes/**/charts/
