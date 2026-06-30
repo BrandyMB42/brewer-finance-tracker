@@ -28,7 +28,9 @@ Secrets required in Secret Manager
 - ``plaid-access-token-chase``                  Chase item access token
 - ``plaid-access-token-citibank-online``        Citi item access token
 - ``plaid-access-token-wells-fargo``            Wells Fargo item access token
-- ``sheets-service-account-json``               Sheets API service-account key
+
+Sheets access uses the function's own identity (Application Default Credentials),
+not a stored key — share the spreadsheet with the runtime service account.
 """
 
 from __future__ import annotations

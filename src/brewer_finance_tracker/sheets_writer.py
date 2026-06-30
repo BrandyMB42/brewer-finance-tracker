@@ -1,12 +1,10 @@
 """Google Sheets writer for debt balances, transactions, and monthly totals.
 
-Authentication uses a GCP service account whose JSON key is stored in Secret
-Manager.  The service account must be granted Editor (or a custom Sheets role)
-on each spreadsheet it writes to.
-
-Secret required in Secret Manager
------------------------------------
-- ``sheets-service-account-json``  Service account key JSON for the Sheets API
+Authentication uses Application Default Credentials (ADC).  In Cloud Run / Cloud
+Functions this resolves to the service's own identity (``finance-tracker-sa``);
+no service-account key is stored or read from Secret Manager.  That identity must
+be granted Editor (or a custom Sheets role) on each spreadsheet it writes to —
+share the sheet with the service account's email.
 
 Sheet layout expected by this module
 --------------------------------------
@@ -17,16 +15,12 @@ Sheet layout expected by this module
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
+import google.auth
 import gspread
-from google.oauth2.service_account import Credentials
 from gspread.utils import ValueInputOption
-
-from .config import Config
-from .secrets.manager import get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -37,26 +31,20 @@ _SCOPES: list[str] = [
 
 
 def _get_client() -> gspread.Client:
-    """Build an authenticated gspread client using credentials from Secret Manager.
+    """Build an authenticated gspread client from Application Default Credentials.
+
+    The credentials come from the runtime environment (the Cloud Function/Run
+    service account), so no key material is read from Secret Manager.
 
     Returns:
         An authorised :class:`gspread.Client` instance.
 
     Raises:
-        ValueError: If ``GCP_PROJECT_ID`` is not set.
-        google.api_core.exceptions.GoogleAPICallError: If the secret cannot be
-            accessed.
-        json.JSONDecodeError: If the stored secret is not valid JSON.
+        google.auth.exceptions.DefaultCredentialsError: If ADC cannot be located
+            (e.g. running locally without ``gcloud auth application-default
+            login`` or a service-account environment).
     """
-    project_id = Config.GCP_PROJECT_ID
-    if not project_id:
-        raise ValueError("GCP_PROJECT_ID must be set to fetch Sheets credentials")
-
-    sa_json_str = get_secret(project_id, "sheets-service-account-json")
-    sa_info: dict[str, Any] = json.loads(sa_json_str)
-    credentials = Credentials.from_service_account_info(  # type: ignore[no-untyped-call]
-        sa_info, scopes=_SCOPES
-    )
+    credentials, _ = google.auth.default(scopes=_SCOPES)
     return gspread.authorize(credentials)
 
 

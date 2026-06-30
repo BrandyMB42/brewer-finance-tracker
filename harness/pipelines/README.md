@@ -244,8 +244,11 @@ project specified by `GCP_PROJECT_ID`:
 | `plaid-client-id` | Plaid API client ID |
 | `plaid-secret` | Plaid API secret (environment-specific) |
 | `plaid-access-token-<item-label>` | Per-item Plaid access token, created at link time by `plaid_link.exchange_public_token` |
-| `sheets-service-account-json` | Service account key JSON used by `sheets_writer` for the Sheets API |
 | `webhook-signing-secret` | HMAC key used to verify inbound Plaid webhook payloads |
+
+Google Sheets access does **not** use a stored key. `sheets_writer` / `snowball_sync`
+authenticate as the runtime service account via Application Default Credentials;
+share each target spreadsheet with `finance-tracker-sa` (Editor).
 
 `scripts/setup.sh` creates the static secrets (everything except the
 per-item access tokens) as placeholders and grants the runtime service account
