@@ -13,7 +13,7 @@ Endpoints
 ---------
 ``POST /create-link-token``  Create a short-lived Link token for the browser.
 ``POST /exchange-token``     Exchange a public token, store the access token in
-                             Secret Manager as ``plaid-access-{slug}``.
+                             Secret Manager as ``plaid-access-token-{slug}``.
 ``GET  /status``             List institutions already connected (by inspecting
                              which ``plaid-access-*`` secrets exist).
 
@@ -60,8 +60,9 @@ PLAID_ENV = os.environ.get("PLAID_ENV", "sandbox").lower()
 # Optional. If unset, gcloud uses its active configured project.
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "")
 
-# The Secret Manager id prefix for stored Plaid access tokens.
-SECRET_PREFIX = "plaid-access-"
+# The Secret Manager id prefix for stored Plaid access tokens. Must match the
+# pattern the deployed app reads from (src/brewer_finance_tracker/plaid_link.py).
+SECRET_PREFIX = "plaid-access-token-"
 
 _PLAID_HOSTS = {
     "sandbox": plaid.Environment.Sandbox,

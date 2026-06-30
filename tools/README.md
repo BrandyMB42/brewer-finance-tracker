@@ -10,7 +10,8 @@ drop in here locally (especially `.env`) stays off git.
 
 A tiny local web tool that walks Plaid Link once per institution and stores the
 resulting long-lived **access token** in GCP Secret Manager as
-`plaid-access-{institution-slug}`. The deployed tracker then reads those secrets
+`plaid-access-token-{institution-slug}` (the same naming the deployed app reads).
+The deployed tracker then reads those secrets
 at runtime to pull transactions — so after setup, you don't need this tool for
 day-to-day use.
 
@@ -83,5 +84,5 @@ this tool until you need to add or re-link an institution.
 | Method | Path                 | Purpose |
 |--------|----------------------|---------|
 | `POST` | `/create-link-token` | Create a short-lived Link token for the browser. |
-| `POST` | `/exchange-token`    | Exchange the public token; store access token as `plaid-access-{slug}`. |
+| `POST` | `/exchange-token`    | Exchange the public token; store access token as `plaid-access-token-{slug}`. |
 | `GET`  | `/status`            | List already-connected institutions + active Plaid env. |
