@@ -6,11 +6,18 @@ This module is deployed as a **scheduled Cloud Function**. On each run it:
    shared :func:`get_secret` pattern) and calls Plaid's ``/liabilities/get``
    endpoint for each connected institution (Chase, Citi, Wells Fargo).
 2. Matches every returned credit-card account to a creditor row in the
-   "THEORETICAL PAYOFFS" worksheet via :data:`PLAID_TO_SHEET_ROW_MAP`.
+   "THEORETICAL PAYOFFS" section of the ``Sheet1`` worksheet via
+   :data:`PLAID_TO_SHEET_ROW_MAP`.
 3. Updates only the matched rows' *Amount Owed*, *Minimum Monthly Payment*, and
    *Updated* cells. Rows for debts Plaid is not connected to (Amazon, Music and
    Arts, Van Repairs, CareCredit, Navient/Aidvantage, Discover, ...) are never
    touched.
+
+The sheet has a single ``Sheet1`` tab; "THEORETICAL PAYOFFS" is a section banner
+(in the *Name of Creditor* column) partway down it, not a separate tab. Matching
+is therefore anchored to the rows *below* that banner and compares only the
+creditor column — several creditor names (e.g. "Stephen's Citi") also appear in
+the paid-off section above, and those historical rows must never be overwritten.
 
 Resilience: a Plaid failure for one institution is logged and skipped so the
 remaining institutions still sync — one bad token never blocks the whole run.
@@ -19,7 +26,7 @@ Secrets required in Secret Manager
 -----------------------------------
 - ``plaid-client-id`` / ``plaid-secret``        Plaid API credentials
 - ``plaid-access-token-chase``                  Chase item access token
-- ``plaid-access-token-citi``                   Citi item access token
+- ``plaid-access-token-citibank-online``        Citi item access token
 - ``plaid-access-token-wells-fargo``            Wells Fargo item access token
 - ``sheets-service-account-json``               Sheets API service-account key
 """
@@ -45,14 +52,18 @@ logger = logging.getLogger(__name__)
 #: The snowball tracking spreadsheet (from its share URL).
 SPREADSHEET_ID = "1icoDUaECtr2272qWxeYntdgNrU6VpEcrqbU1aHJIdsw"
 
-#: The worksheet/tab that holds the creditor payoff rows.
-WORKSHEET_NAME = "THEORETICAL PAYOFFS"
+#: The (only) worksheet/tab in the spreadsheet.
+WORKSHEET_NAME = "Sheet1"
+
+#: Banner text (in the creditor column) marking the start of the section we
+#: write to. Only rows below this banner are eligible for matching.
+SECTION_BANNER = "THEORETICAL PAYOFFS"
 
 #: Institution display name -> Secret Manager id holding its access token.
 #: Slugs follow the project-wide ``plaid-access-token-{slug}`` convention.
 INSTITUTION_SECRETS: dict[str, str] = {
     "Chase": "plaid-access-token-chase",
-    "Citi": "plaid-access-token-citi",
+    "Citi": "plaid-access-token-citibank-online",
     "Wells Fargo": "plaid-access-token-wells-fargo",
 }
 
@@ -75,7 +86,8 @@ PLAID_TO_SHEET_ROW_MAP: dict[str, str] = {
     "Wells Fargo - (label TBD)": "Wells Fargo Again",
 }
 
-#: Column header text in the worksheet that this function writes to.
+#: Column header text (row 3 of the worksheet) used to locate columns.
+CREDITOR_HEADER = "Name of Creditor"
 AMOUNT_OWED_HEADER = "Amount Owed"
 MIN_PAYMENT_HEADER = "Minimum Monthly Payment"
 UPDATED_HEADER = "Updated"
@@ -188,44 +200,67 @@ def collect_plaid_accounts() -> list[dict[str, Any]]:
     return accounts
 
 
-def _locate_layout(rows: list[list[str]]) -> tuple[int, dict[str, int]]:
-    """Locate the header row and the 1-based column numbers we write to.
+def _locate_layout(rows: list[list[str]]) -> dict[str, int]:
+    """Locate the 1-based column numbers we read/write, keyed by header text.
 
     Args:
         rows: All worksheet values (``worksheet.get_all_values()``).
 
     Returns:
-        A tuple of ``(header_row_index, columns)`` where ``header_row_index`` is
-        0-based and ``columns`` maps each known header to its 1-based column.
+        A dict mapping each known header to its 1-based column number. Always
+        includes the creditor and amount-owed columns; minimum-payment and
+        updated columns are included when present.
 
     Raises:
         SnowballSyncError: If the header row cannot be found.
     """
-    for index, row in enumerate(rows):
+    for row in rows:
         normalized = [cell.strip() for cell in row]
-        if AMOUNT_OWED_HEADER in normalized and UPDATED_HEADER in normalized:
-            columns = {
+        if CREDITOR_HEADER in normalized and AMOUNT_OWED_HEADER in normalized:
+            return {
                 header: normalized.index(header) + 1
-                for header in (AMOUNT_OWED_HEADER, MIN_PAYMENT_HEADER, UPDATED_HEADER)
+                for header in (
+                    CREDITOR_HEADER,
+                    AMOUNT_OWED_HEADER,
+                    MIN_PAYMENT_HEADER,
+                    UPDATED_HEADER,
+                )
                 if header in normalized
             }
-            return index, columns
     raise SnowballSyncError(
-        f"Could not find a header row containing {AMOUNT_OWED_HEADER!r} and "
-        f"{UPDATED_HEADER!r} in worksheet {WORKSHEET_NAME!r}"
+        f"Could not find a header row containing {CREDITOR_HEADER!r} and "
+        f"{AMOUNT_OWED_HEADER!r} in worksheet {WORKSHEET_NAME!r}"
+    )
+
+
+def _find_section_start(rows: list[list[str]]) -> int:
+    """Return the 0-based index of the ``SECTION_BANNER`` row.
+
+    Raises:
+        SnowballSyncError: If the banner is not found.
+    """
+    for index, row in enumerate(rows):
+        if any(cell.strip() == SECTION_BANNER for cell in row):
+            return index
+    raise SnowballSyncError(
+        f"Could not find the {SECTION_BANNER!r} section banner in "
+        f"worksheet {WORKSHEET_NAME!r}"
     )
 
 
 def _find_creditor_row(
-    rows: list[list[str]], header_index: int, creditor: str
+    rows: list[list[str]], section_start: int, creditor_col: int, creditor: str
 ) -> int | None:
-    """Return the 1-based row number whose creditor cell matches *creditor*.
+    """Return the 1-based row whose creditor cell matches *creditor*.
 
-    Searches every cell of each data row (below the header) for an exact match,
-    so it does not depend on which column holds the creditor name.
+    Only rows *below* ``section_start`` are considered, and only the creditor
+    column is compared — so identically-named paid-off rows above the section
+    banner are never matched (and never overwritten).
     """
-    for index in range(header_index + 1, len(rows)):
-        if any(cell.strip() == creditor for cell in rows[index]):
+    col = creditor_col - 1  # 0-based index into each row
+    for index in range(section_start + 1, len(rows)):
+        row = rows[index]
+        if col < len(row) and row[col].strip() == creditor:
             return index + 1
     return None
 
@@ -254,7 +289,9 @@ def update_snowball_sheet(
     stamp = f"Auto-synced {timestamp}"
 
     rows = worksheet.get_all_values()
-    header_index, columns = _locate_layout(rows)
+    columns = _locate_layout(rows)
+    section_start = _find_section_start(rows)
+    creditor_col = columns[CREDITOR_HEADER]
 
     updated: list[str] = []
     for account in accounts:
@@ -278,10 +315,10 @@ def update_snowball_sheet(
             )
             continue
 
-        row_num = _find_creditor_row(rows, header_index, creditor)
+        row_num = _find_creditor_row(rows, section_start, creditor_col, creditor)
         if row_num is None:
             logger.warning(
-                "Mapped creditor not found in worksheet; skipping",
+                "Mapped creditor not found in section; skipping",
                 extra={"plaid_account_name": plaid_name, "creditor": creditor},
             )
             continue
@@ -290,7 +327,8 @@ def update_snowball_sheet(
         minimum = account.get("minimum_payment")
         if MIN_PAYMENT_HEADER in columns and minimum is not None:
             worksheet.update_cell(row_num, columns[MIN_PAYMENT_HEADER], minimum)
-        worksheet.update_cell(row_num, columns[UPDATED_HEADER], stamp)
+        if UPDATED_HEADER in columns:
+            worksheet.update_cell(row_num, columns[UPDATED_HEADER], stamp)
 
         updated.append(creditor)
         logger.info(

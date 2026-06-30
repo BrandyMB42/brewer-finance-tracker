@@ -14,19 +14,26 @@ import pytest
 
 from brewer_finance_tracker import snowball_sync
 
-# A representative worksheet layout: a title row, a header row, then creditor
-# rows — including non-Plaid debts that must never be written to.
+# A representative worksheet, mirroring the live sheet's real shape: a single
+# tab whose row 3 is the header, a paid-off section, then a "THEORETICAL PAYOFFS"
+# banner, then the active rows we sync. Note "Stephen's Citi" appears BOTH in the
+# paid-off section (row 5) and the theoretical section (row 12) — only the latter
+# may ever be written.
 SHEET_ROWS: list[list[str]] = [
-    ["THEORETICAL PAYOFFS", "", "", "", ""],
-    ["Creditor", "Amount Owed", "Minimum Monthly Payment", "APR", "Updated"],
-    ["My Chase Again", "1000", "50", "22%", "2026-01-01"],
-    ["Stephen's Chase (Again)", "2000", "75", "24%", "2026-01-01"],
-    ["My Citi Rewards #2", "500", "35", "19%", "2026-01-01"],
-    ["Stephen's Citi", "750", "40", "21%", "2026-01-01"],
-    ["Wells Fargo Again", "1500", "60", "18%", "2026-01-01"],
-    ["Discover", "300", "25", "17%", "2026-01-01"],
-    ["CareCredit", "900", "45", "0%", "2026-01-01"],
-    ["Navient/Aidvantage", "12000", "150", "5%", "2026-01-01"],
+    ["Snowball Tracker", "", "", "", ""],                                    # 1 title
+    ["", "", "", "", ""],                                                    # 2 blank
+    ["Name of Creditor", "Amount Owed", "Minimum Monthly Payment", "Interest Rate", "Updated"],  # 3 header
+    ["Chase Bank", "$0.00", "$0.00", "20.49%", "Updated 3/17"],             # 4 paid-off
+    ["Stephen's Citi", "$0.00", "$0.00", "28.24%", "Updated 12/11"],        # 5 paid-off DUP
+    ["Discover", "$0.00", "$0.00", "0%", "Updated 12/27"],                  # 6 paid-off non-plaid
+    ["THEORETICAL PAYOFFS", "", "", "", ""],                                # 7 section banner
+    ["My Chase Again", "100", "10", "19.49%", "Updated 6/29"],              # 8
+    ["Stephen's Chase (Again)", "200", "20", "19.49%", "Updated 6/29"],     # 9
+    ["My Citi Rewards #2", "300", "30", "26.49%", "Updated 6/29"],          # 10
+    ["Wells Fargo Again", "400", "25", "28.49%", "Updated 6/29"],           # 11
+    ["Stephen's Citi", "14000", "223", "0%", "Updated 6/29"],               # 12 theoretical DUP
+    ["Music and Arts", "5530", "250", "0%", "Updated 6/29"],                # 13 non-plaid
+    ["Van Repairs", "2682", "135", "0%", "Updated 6/29"],                   # 14 non-plaid
 ]
 
 # 1-based column numbers matching the header row above.
@@ -34,8 +41,9 @@ COL_AMOUNT = 2
 COL_MIN = 3
 COL_UPDATED = 5
 
-# Rows (1-based) of the non-Plaid debts that must remain untouched.
-NON_PLAID_ROWS = {8, 9, 10}
+# Rows (1-based) that must remain untouched: every paid-off row (incl. the
+# duplicate Stephen's Citi at row 5) and the non-Plaid theoretical rows.
+NON_PLAID_ROWS = {4, 5, 6, 13, 14}
 
 FIXED_NOW = datetime(2026, 6, 30, 14, 30, 0, tzinfo=timezone.utc)
 EXPECTED_STAMP = "Auto-synced 2026-06-30 14:30:00 UTC"
@@ -70,10 +78,10 @@ def test_successful_sync_updates_correct_rows() -> None:
 
     assert updated == ["My Chase Again"]
     updates = _updates_by_cell(worksheet)
-    # "My Chase Again" is row 3 in the layout above.
-    assert updates[(3, COL_AMOUNT)] == 1234.56
-    assert updates[(3, COL_MIN)] == 60.0
-    assert updates[(3, COL_UPDATED)] == EXPECTED_STAMP
+    # "My Chase Again" is row 8 in the layout above.
+    assert updates[(8, COL_AMOUNT)] == 1234.56
+    assert updates[(8, COL_MIN)] == 60.0
+    assert updates[(8, COL_UPDATED)] == EXPECTED_STAMP
 
 
 def test_non_plaid_rows_remain_untouched() -> None:
@@ -86,10 +94,28 @@ def test_non_plaid_rows_remain_untouched() -> None:
         _account("Wells Fargo - (label TBD)", 1500.0),
     ]
 
+    accounts.append(_account("Citi - Rewards #2 (label TBD)", 14000.0))  # Stephen's Citi
+    accounts.append(_account("Chase - Disney Premier #2 (label TBD)", 2000.0))  # Stephen's Chase
+
     snowball_sync.update_snowball_sheet(worksheet, accounts, now=FIXED_NOW)
 
     touched_rows = {row for (row, _col) in _updates_by_cell(worksheet)}
     assert touched_rows.isdisjoint(NON_PLAID_ROWS)
+
+
+def test_duplicate_creditor_updates_theoretical_not_paid_off() -> None:
+    """A creditor that also exists in the paid-off section updates only the
+    theoretical-section row, never the historical $0.00 one."""
+    worksheet = _make_worksheet()
+    # Maps to "Stephen's Citi", which appears at row 5 (paid off) and row 12.
+    accounts = [_account("Citi - Rewards #2 (label TBD)", 14000.0, 223.0)]
+
+    snowball_sync.update_snowball_sheet(worksheet, accounts, now=FIXED_NOW)
+
+    updates = _updates_by_cell(worksheet)
+    assert updates[(12, COL_AMOUNT)] == 14000.0
+    touched_rows = {row for (row, _col) in updates}
+    assert 5 not in touched_rows
 
 
 def test_partial_failure_still_updates_others() -> None:
@@ -104,7 +130,7 @@ def test_partial_failure_still_updates_others() -> None:
 
     token_for = {
         "plaid-access-token-chase": "token-chase",
-        "plaid-access-token-citi": "token-citi",
+        "plaid-access-token-citibank-online": "token-citi",
         "plaid-access-token-wells-fargo": "token-wells",
     }
 
@@ -125,12 +151,13 @@ def test_partial_failure_still_updates_others() -> None:
 
 
 def test_row_matching_by_creditor_name() -> None:
-    """_find_creditor_row resolves the right 1-based row, regardless of column."""
+    """_find_creditor_row resolves the right 1-based row within the section."""
     rows = [list(r) for r in SHEET_ROWS]
-    # Header is at index 1 (0-based).
-    assert snowball_sync._find_creditor_row(rows, 1, "Wells Fargo Again") == 7
-    assert snowball_sync._find_creditor_row(rows, 1, "Stephen's Citi") == 6
-    assert snowball_sync._find_creditor_row(rows, 1, "Not A Creditor") is None
+    section_start = 6  # 0-based index of the "THEORETICAL PAYOFFS" banner (row 7)
+    assert snowball_sync._find_creditor_row(rows, section_start, 1, "Wells Fargo Again") == 11
+    # Resolves the theoretical row (12), not the paid-off duplicate (5).
+    assert snowball_sync._find_creditor_row(rows, section_start, 1, "Stephen's Citi") == 12
+    assert snowball_sync._find_creditor_row(rows, section_start, 1, "Not A Creditor") is None
 
 
 def test_unmapped_account_is_skipped() -> None:
@@ -152,10 +179,10 @@ def test_missing_minimum_payment_skips_min_cell() -> None:
     snowball_sync.update_snowball_sheet(worksheet, accounts, now=FIXED_NOW)
 
     updates = _updates_by_cell(worksheet)
-    # "Citi - Rewards" maps to "My Citi Rewards #2" — row 5.
-    assert updates[(5, COL_AMOUNT)] == 600.0
-    assert (5, COL_MIN) not in updates
-    assert updates[(5, COL_UPDATED)] == EXPECTED_STAMP
+    # "Citi - Rewards" maps to "My Citi Rewards #2" — row 10.
+    assert updates[(10, COL_AMOUNT)] == 600.0
+    assert (10, COL_MIN) not in updates
+    assert updates[(10, COL_UPDATED)] == EXPECTED_STAMP
 
 
 def test_missing_header_raises() -> None:
@@ -165,6 +192,22 @@ def test_missing_header_raises() -> None:
 
     with pytest.raises(snowball_sync.SnowballSyncError):
         snowball_sync.update_snowball_sheet(worksheet, [_account("x", 1.0)], now=FIXED_NOW)
+
+
+def test_missing_section_banner_raises() -> None:
+    """Headers present but no section banner raises a clear error."""
+    worksheet = MagicMock()
+    worksheet.get_all_values.return_value = [
+        ["Name of Creditor", "Amount Owed", "Minimum Monthly Payment", "Interest Rate", "Updated"],
+        ["My Chase Again", "1", "2", "3", "x"],
+    ]
+
+    with pytest.raises(snowball_sync.SnowballSyncError):
+        snowball_sync.update_snowball_sheet(
+            worksheet,
+            [_account("Chase - Disney Premier (label TBD)", 1.0)],
+            now=FIXED_NOW,
+        )
 
 
 def test_fetch_liabilities_normalizes_and_joins_accounts() -> None:
