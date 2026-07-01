@@ -70,10 +70,12 @@ gcloud artifacts repositories create "${REPO_NAME}" \
 # Each secret is created as a placeholder.
 # Run the commented command below each block to populate the real value.
 
+# Sheets access uses the runtime service account's own identity (ADC), so no
+# Sheets key secret is created here — just share each spreadsheet with
+# ${SA_EMAIL}.
 SECRETS=(
   "plaid-client-id"
   "plaid-secret"
-  "sheets-service-account-json"
   "webhook-signing-secret"
 )
 
@@ -108,10 +110,10 @@ Bootstrap complete.  Update each secret before running the first deploy:
   echo -n "<plaid-client-id>"  | gcloud secrets versions add plaid-client-id  --data-file=- --project=${PROJECT_ID}
   echo -n "<plaid-secret>"     | gcloud secrets versions add plaid-secret      --data-file=- --project=${PROJECT_ID}
 
-  # Google service account JSON for Sheets access
-  gcloud secrets versions add sheets-service-account-json --data-file=sa.json --project=${PROJECT_ID}
-
   # Random string used to verify Plaid webhook HMAC signatures
   openssl rand -hex 32 | gcloud secrets versions add webhook-signing-secret --data-file=- --project=${PROJECT_ID}
+
+For Google Sheets access, share each target spreadsheet with the runtime service
+account (Editor): ${SA_EMAIL}
 
 DONE

@@ -119,3 +119,18 @@ def test_write_monthly_totals_empty_is_noop() -> None:
     with patch.object(sheets_writer, "_get_client") as mock_get_client:
         sheets_writer.write_monthly_totals("sheet-1", [])
     mock_get_client.assert_not_called()
+
+
+def test_get_client_uses_application_default_credentials() -> None:
+    """The client authenticates via ADC (runtime identity), not a stored key."""
+    fake_creds = MagicMock()
+    fake_client = MagicMock()
+    with (
+        patch("google.auth.default", return_value=(fake_creds, "proj")) as mock_default,
+        patch.object(sheets_writer.gspread, "authorize", return_value=fake_client) as mock_auth,
+    ):
+        result = sheets_writer._get_client()
+
+    mock_default.assert_called_once_with(scopes=sheets_writer._SCOPES)
+    mock_auth.assert_called_once_with(fake_creds)
+    assert result is fake_client
