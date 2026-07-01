@@ -13,7 +13,12 @@ Endpoints
 ---------
 ``POST /create-link-token``  Create a short-lived Link token for the browser.
 ``POST /exchange-token``     Exchange a public token, store the access token in
-                             Secret Manager as ``plaid-access-token-{slug}``.
+                             Secret Manager as
+                             ``plaid-access-token-{slug}-{disambiguator}`` where
+                             the disambiguator is the account's last-4 (mask) or,
+                             if unavailable, an item_id suffix. This keeps the
+                             secret unique per Item, so connecting a second card
+                             at the same institution does not overwrite the first.
 ``GET  /status``             List institutions already connected (by inspecting
                              which ``plaid-access-*`` secrets exist).
 
@@ -39,6 +44,7 @@ from flask import Flask, jsonify, request
 from plaid.api import plaid_api
 from plaid.api_client import ApiClient
 from plaid.configuration import Configuration
+from plaid.model.accounts_get_request import AccountsGetRequest
 from plaid.model.country_code import CountryCode
 from plaid.model.institutions_get_by_id_request import InstitutionsGetByIdRequest
 from plaid.model.item_get_request import ItemGetRequest
@@ -71,7 +77,7 @@ _PLAID_HOSTS = {
 
 CLIENT_USER_ID = "brewer-family-setup"
 CLIENT_NAME = "Brewer Finance Tracker"
-PRODUCTS = ["transactions", "liabilities", "balance"]
+PRODUCTS = ["transactions", "liabilities"]
 COUNTRY_CODES = ["US"]
 
 
@@ -114,6 +120,36 @@ def _slugify(name: str) -> str:
     """
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
     return slug or "unknown"
+
+
+def _model_get(obj: object, key: str) -> object | None:
+    """Safely read *key* from a Plaid model (or dict), returning None if absent."""
+    try:
+        return obj[key]  # type: ignore[index]
+    except (KeyError, AttributeError, TypeError):
+        return None
+
+
+def _account_disambiguator(
+    client: plaid_api.PlaidApi, access_token: str, item_id: str
+) -> str:
+    """Return a per-Item disambiguator for the secret name.
+
+    Prefers the last-4 (mask) of the first account on the Item; if no mask is
+    available at exchange time, falls back to a suffix of the item_id (which is
+    stable and unique per Item). The result keeps each Item's token in its own
+    Secret Manager secret so a second card at the same institution never
+    overwrites the first.
+    """
+    try:
+        response = client.accounts_get(AccountsGetRequest(access_token=access_token))
+        for account in response["accounts"]:
+            mask = _model_get(account, "mask")
+            if mask:
+                return str(mask)
+    except plaid.ApiException:
+        pass
+    return item_id[-8:]
 
 
 # ---------------------------------------------------------------------------
@@ -250,8 +286,11 @@ def exchange_token():  # type: ignore[no-untyped-def]
         if not institution_name:
             institution_name = _lookup_institution_name(client, access_token)
 
+        # Disambiguate per Item so a second card at the same institution does
+        # not overwrite the first (e.g. plaid-access-token-chase-7254).
         slug = _slugify(institution_name)
-        secret_id = f"{SECRET_PREFIX}{slug}"
+        disambiguator = _slugify(_account_disambiguator(client, access_token, item_id))
+        secret_id = f"{SECRET_PREFIX}{slug}-{disambiguator}"
         _store_access_token(secret_id, access_token)
 
         return jsonify(

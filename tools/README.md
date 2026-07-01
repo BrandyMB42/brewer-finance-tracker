@@ -8,12 +8,14 @@ drop in here locally (especially `.env`) stays off git.
 
 ## `plaid-link-setup/` — one-time bank account connection
 
-A tiny local web tool that walks Plaid Link once per institution and stores the
+A tiny local web tool that walks Plaid Link once **per card/Item** and stores the
 resulting long-lived **access token** in GCP Secret Manager as
-`plaid-access-token-{institution-slug}` (the same naming the deployed app reads).
-The deployed tracker then reads those secrets
-at runtime to pull transactions — so after setup, you don't need this tool for
-day-to-day use.
+`plaid-access-token-{institution-slug}-{disambiguator}`, where the disambiguator
+is the account's last-4 (mask) or an item_id suffix. Including a disambiguator
+keeps each Item's token in its own secret, so connecting a **second card at the
+same institution** does not overwrite the first. The deployed tracker reads all
+`plaid-access-token-*` secrets at runtime — so after setup, you don't need this
+tool for day-to-day use.
 
 ```
 plaid-link-setup/
@@ -84,5 +86,5 @@ this tool until you need to add or re-link an institution.
 | Method | Path                 | Purpose |
 |--------|----------------------|---------|
 | `POST` | `/create-link-token` | Create a short-lived Link token for the browser. |
-| `POST` | `/exchange-token`    | Exchange the public token; store access token as `plaid-access-token-{slug}`. |
+| `POST` | `/exchange-token`    | Exchange the public token; store access token as `plaid-access-token-{slug}-{disambiguator}` (last-4 or item_id suffix). |
 | `GET`  | `/status`            | List already-connected institutions + active Plaid env. |
