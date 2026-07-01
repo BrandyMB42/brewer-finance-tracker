@@ -25,9 +25,9 @@ remaining institutions still sync — one bad token never blocks the whole run.
 Secrets required in Secret Manager
 -----------------------------------
 - ``plaid-client-id`` / ``plaid-secret``        Plaid API credentials
-- ``plaid-access-token-chase``                  Chase item access token
-- ``plaid-access-token-citibank-online``        Citi item access token
-- ``plaid-access-token-wells-fargo``            Wells Fargo item access token
+- ``plaid-access-token-{institution}-*``        One access-token secret per card
+  (Plaid Item), e.g. ``plaid-access-token-chase-7254``. All secrets matching each
+  institution prefix (see ``INSTITUTION_SECRET_PREFIXES``) are read.
 
 Sheets access uses the function's own identity (Application Default Credentials),
 not a stored key — share the spreadsheet with the runtime service account.
@@ -61,9 +61,12 @@ WORKSHEET_NAME = "Sheet1"
 #: write to. Only rows below this banner are eligible for matching.
 SECTION_BANNER = "THEORETICAL PAYOFFS"
 
-#: Institution display name -> Secret Manager id holding its access token.
-#: Slugs follow the project-wide ``plaid-access-token-{slug}`` convention.
-INSTITUTION_SECRETS: dict[str, str] = {
+#: Institution display name -> Secret Manager id *prefix* for its access tokens.
+#: Each institution may have MULTIPLE tokens (one Plaid Item per card), stored by
+#: the setup tool as ``plaid-access-token-{slug}-{disambiguator}``. We list every
+#: secret matching the prefix rather than assuming a single token per institution
+#: (a bare ``plaid-access-token-{slug}`` with no suffix is also matched).
+INSTITUTION_SECRET_PREFIXES: dict[str, str] = {
     "Chase": "plaid-access-token-chase",
     "Citi": "plaid-access-token-citibank-online",
     "Wells Fargo": "plaid-access-token-wells-fargo",
@@ -182,24 +185,64 @@ def collect_plaid_accounts() -> list[dict[str, Any]]:
     client = _build_plaid_client()
     accounts: list[dict[str, Any]] = []
 
-    for institution, secret_id in INSTITUTION_SECRETS.items():
-        try:
-            access_token = get_secret(project_id, secret_id)
-            institution_accounts = fetch_liabilities(client, access_token)
-        except Exception:  # noqa: BLE001 - isolate one institution's failure
-            logger.exception(
-                "Failed to fetch liabilities; skipping institution",
-                extra={"institution": institution},
+    for institution, prefix in INSTITUTION_SECRET_PREFIXES.items():
+        secret_ids = _list_token_secret_ids(project_id, prefix)
+        if not secret_ids:
+            logger.warning(
+                "No access-token secrets found for institution",
+                extra={"institution": institution, "prefix": prefix},
             )
             continue
 
-        logger.info(
-            "Fetched liabilities",
-            extra={"institution": institution, "account_count": len(institution_accounts)},
-        )
-        accounts.extend(institution_accounts)
+        # Each secret is an independent Plaid Item; isolate per-token failures so
+        # one bad token never blocks the others (or the other institutions).
+        for secret_id in secret_ids:
+            try:
+                access_token = get_secret(project_id, secret_id)
+                item_accounts = fetch_liabilities(client, access_token)
+            except Exception:  # noqa: BLE001 - isolate one token's failure
+                logger.exception(
+                    "Failed to fetch liabilities; skipping token",
+                    extra={"institution": institution, "secret_id": secret_id},
+                )
+                continue
+
+            logger.info(
+                "Fetched liabilities",
+                extra={
+                    "institution": institution,
+                    "secret_id": secret_id,
+                    "account_count": len(item_accounts),
+                },
+            )
+            accounts.extend(item_accounts)
 
     return accounts
+
+
+def _list_token_secret_ids(project_id: str, prefix: str) -> list[str]:
+    """Return the ids of all access-token secrets for an institution *prefix*.
+
+    Matches both a bare ``{prefix}`` secret and disambiguated
+    ``{prefix}-{suffix}`` secrets (one per Plaid Item / card).
+
+    Args:
+        project_id: GCP project that owns the secrets.
+        prefix: The ``plaid-access-token-{slug}`` prefix for an institution.
+
+    Returns:
+        Sorted secret ids (short names, not full resource paths).
+    """
+    from google.cloud import secretmanager  # imported here to avoid top-level cost
+
+    client = secretmanager.SecretManagerServiceClient()
+    parent = f"projects/{project_id}"
+    ids: list[str] = []
+    for secret in client.list_secrets(request={"parent": parent, "filter": f"name:{prefix}"}):
+        short = secret.name.rsplit("/", 1)[-1]
+        if short == prefix or short.startswith(f"{prefix}-"):
+            ids.append(short)
+    return sorted(ids)
 
 
 def _locate_layout(rows: list[list[str]]) -> dict[str, int]:
@@ -327,7 +370,9 @@ def update_snowball_sheet(
 
         worksheet.update_cell(row_num, columns[AMOUNT_OWED_HEADER], account.get("balance"))
         minimum = account.get("minimum_payment")
-        if MIN_PAYMENT_HEADER in columns and minimum is not None:
+        # Treat a missing OR zero minimum as "no data" — Plaid reports 0 for some
+        # cards, and writing it would clobber a real minimum kept in the sheet.
+        if MIN_PAYMENT_HEADER in columns and minimum:
             worksheet.update_cell(row_num, columns[MIN_PAYMENT_HEADER], minimum)
         if UPDATED_HEADER in columns:
             worksheet.update_cell(row_num, columns[UPDATED_HEADER], stamp)

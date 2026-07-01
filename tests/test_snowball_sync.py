@@ -119,7 +119,17 @@ def test_duplicate_creditor_updates_theoretical_not_paid_off() -> None:
 
 
 def test_partial_failure_still_updates_others() -> None:
-    """If one institution's Plaid call fails, the others still sync."""
+    """If one institution's token fails, the others still sync."""
+    prefix_to_ids = {
+        "plaid-access-token-chase": ["plaid-access-token-chase-1111"],
+        "plaid-access-token-citibank-online": ["plaid-access-token-citibank-online-2222"],
+        "plaid-access-token-wells-fargo": ["plaid-access-token-wells-fargo-3333"],
+    }
+    token_for = {
+        "plaid-access-token-chase-1111": "token-chase",
+        "plaid-access-token-citibank-online-2222": "token-citi",
+        "plaid-access-token-wells-fargo-3333": "token-wells",
+    }
 
     def fake_fetch(_client: Any, access_token: str) -> list[dict[str, Any]]:
         if access_token == "token-citi":
@@ -128,15 +138,13 @@ def test_partial_failure_still_updates_others() -> None:
             return [_account("Chase - Disney Premier (label TBD)", 1000.0)]
         return [_account("Wells Fargo - (label TBD)", 1500.0)]
 
-    token_for = {
-        "plaid-access-token-chase": "token-chase",
-        "plaid-access-token-citibank-online": "token-citi",
-        "plaid-access-token-wells-fargo": "token-wells",
-    }
-
     with (
         patch.object(snowball_sync.Config, "GCP_PROJECT_ID", "proj"),
         patch.object(snowball_sync, "_build_plaid_client", return_value=MagicMock()),
+        patch.object(
+            snowball_sync, "_list_token_secret_ids",
+            side_effect=lambda _p, prefix: prefix_to_ids[prefix],
+        ),
         patch.object(snowball_sync, "get_secret", side_effect=lambda _p, s: token_for[s]),
         patch.object(snowball_sync, "fetch_liabilities", side_effect=fake_fetch),
     ):
@@ -148,6 +156,40 @@ def test_partial_failure_still_updates_others() -> None:
         "Chase - Disney Premier (label TBD)",
         "Wells Fargo - (label TBD)",
     }
+
+
+def test_multiple_tokens_per_institution_all_fetched() -> None:
+    """Every token under an institution prefix is fetched (one Item per card)."""
+    prefix_to_ids = {
+        "plaid-access-token-chase": [
+            "plaid-access-token-chase-1111",
+            "plaid-access-token-chase-2222",
+        ],
+        "plaid-access-token-citibank-online": [],
+        "plaid-access-token-wells-fargo": [],
+    }
+    token_for = {
+        "plaid-access-token-chase-1111": "tok-a",
+        "plaid-access-token-chase-2222": "tok-b",
+    }
+
+    def fake_fetch(_client: Any, access_token: str) -> list[dict[str, Any]]:
+        name = "My Chase" if access_token == "tok-a" else "Stephen's Chase"
+        return [_account(name, 1.0)]
+
+    with (
+        patch.object(snowball_sync.Config, "GCP_PROJECT_ID", "proj"),
+        patch.object(snowball_sync, "_build_plaid_client", return_value=MagicMock()),
+        patch.object(
+            snowball_sync, "_list_token_secret_ids",
+            side_effect=lambda _p, prefix: prefix_to_ids[prefix],
+        ),
+        patch.object(snowball_sync, "get_secret", side_effect=lambda _p, s: token_for[s]),
+        patch.object(snowball_sync, "fetch_liabilities", side_effect=fake_fetch),
+    ):
+        accounts = snowball_sync.collect_plaid_accounts()
+
+    assert {a["name"] for a in accounts} == {"My Chase", "Stephen's Chase"}
 
 
 def test_row_matching_by_creditor_name() -> None:
@@ -182,6 +224,19 @@ def test_missing_minimum_payment_skips_min_cell() -> None:
     # "Citi - Rewards" maps to "My Citi Rewards #2" — row 10.
     assert updates[(10, COL_AMOUNT)] == 600.0
     assert (10, COL_MIN) not in updates
+    assert updates[(10, COL_UPDATED)] == EXPECTED_STAMP
+
+
+def test_zero_minimum_payment_is_not_written() -> None:
+    """A 0.0 minimum is treated as no-data and does not overwrite the sheet."""
+    worksheet = _make_worksheet()
+    accounts = [_account("Citi - Rewards (label TBD)", 600.0, minimum=0.0)]
+
+    snowball_sync.update_snowball_sheet(worksheet, accounts, now=FIXED_NOW)
+
+    updates = _updates_by_cell(worksheet)
+    assert updates[(10, COL_AMOUNT)] == 600.0
+    assert (10, COL_MIN) not in updates  # zero minimum skipped
     assert updates[(10, COL_UPDATED)] == EXPECTED_STAMP
 
 
