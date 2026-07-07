@@ -9,6 +9,7 @@ description = "Finance webhook receiver and event processor"
 requires-python = ">=3.11"
 dependencies = [
     "flask>=3.0",
+    "functions-framework>=3.0",
     "google-cloud-secret-manager>=2.20",
     "plaid-python>=18.0",
     "gspread>=6.0",
@@ -37,6 +38,11 @@ strict = true
 # plaid-python ships no py.typed marker or stubs.
 [[tool.mypy.overrides]]
 module = ["plaid.*"]
+ignore_missing_imports = true
+
+# functions-framework ships no type stubs.
+[[tool.mypy.overrides]]
+module = ["functions_framework.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
