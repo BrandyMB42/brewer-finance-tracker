@@ -349,3 +349,210 @@ def test_scheduled_entry_point_runs_sync() -> None:
     with patch.object(snowball_sync, "run_sync") as mock_run:
         snowball_sync.sync_snowball_sheet_scheduled({"data": "ignored"}, None)
     mock_run.assert_called_once_with()
+
+
+# --------------------------------------------------------------------------
+# Dry-run: read-only planning, discovery collector, report, and CLI.
+# --------------------------------------------------------------------------
+def test_plan_updates_classifies_each_account() -> None:
+    """plan_updates labels matched, unmapped, and error accounts (no writes)."""
+    rows = [list(r) for r in SHEET_ROWS]
+    accounts = [
+        {
+            "name": "Chase - Disney Premier (label TBD)",
+            "balance": 1000.0,
+            "minimum_payment": 50.0,
+            "apr": 19.49,
+            "institution": "Chase",
+        },
+        {"name": "Totally Unknown Card", "balance": 5.0, "minimum_payment": 1.0},
+        {"name": "", "error": "boom", "institution": "Wells Fargo"},
+    ]
+
+    by_status = {p["status"]: p for p in snowball_sync.plan_updates(rows, accounts)}
+
+    assert by_status["matched"]["creditor"] == "My Chase Again"
+    assert by_status["matched"]["row"] == 8
+    assert by_status["unmapped"]["name"] == "Totally Unknown Card"
+    assert by_status["error"]["error"] == "boom"
+
+
+def test_plan_updates_row_not_found_when_creditor_absent() -> None:
+    """A mapped creditor with no row below the banner is 'row_not_found'."""
+    rows = [list(r) for r in SHEET_ROWS]
+    accounts = [{"name": "Ghost", "balance": 1.0, "minimum_payment": 1.0, "apr": 1.0}]
+
+    with patch.dict(snowball_sync.PLAID_TO_SHEET_ROW_MAP, {"Ghost": "No Such Creditor"}):
+        plans = snowball_sync.plan_updates(rows, accounts)
+
+    assert plans[0]["status"] == "row_not_found"
+    assert plans[0]["creditor"] == "No Such Creditor"
+    assert plans[0]["row"] is None
+
+
+def test_run_sync_dry_run_writes_nothing() -> None:
+    """A dry-run computes the plan but never calls update_cell."""
+    worksheet = _make_worksheet()
+    accounts = [_account("Chase - Disney Premier (label TBD)", 1000.0)]
+
+    with (
+        patch.object(snowball_sync, "collect_plaid_accounts", return_value=accounts),
+        patch.object(snowball_sync, "_open_worksheet", return_value=worksheet),
+    ):
+        summary = snowball_sync.run_sync(dry_run=True)
+
+    worksheet.update_cell.assert_not_called()
+    assert summary["dry_run"] is True
+    assert summary["accounts_fetched"] == 1
+    assert summary["would_update"] == ["My Chase Again"]
+    assert summary["unmapped"] == []
+    assert summary["plan"][0]["row"] == 8
+
+
+def test_run_sync_dry_run_all_tokens_uses_discovery_collector() -> None:
+    """--all-tokens routes through the discovery collector, not the sync one."""
+    worksheet = _make_worksheet()
+    accounts = [{"name": "Mystery", "balance": 1.0, "institution": "New Bank"}]
+
+    with (
+        patch.object(
+            snowball_sync, "collect_accounts_for_dry_run", return_value=accounts
+        ) as discovery,
+        patch.object(snowball_sync, "collect_plaid_accounts") as real,
+        patch.object(snowball_sync, "_open_worksheet", return_value=worksheet),
+    ):
+        summary = snowball_sync.run_sync(dry_run=True, all_tokens=True)
+
+    discovery.assert_called_once()
+    real.assert_not_called()
+    worksheet.update_cell.assert_not_called()
+    assert summary["unmapped"] == ["Mystery"]
+
+
+def test_institution_for_secret_known_and_unknown() -> None:
+    """Known prefixes resolve to display names; unknown ones fall back to slug."""
+    assert (
+        snowball_sync._institution_for_secret("plaid-access-token-chase-7254") == "Chase"
+    )
+    assert (
+        snowball_sync._institution_for_secret("plaid-access-token-citibank-online-1")
+        == "Citi"
+    )
+    assert (
+        snowball_sync._institution_for_secret("plaid-access-token-amex-1001")
+        == "amex-1001"
+    )
+
+
+def test_collect_accounts_for_dry_run_records_fetch_errors() -> None:
+    """Discovery reads all tokens and records a fetch failure as an error entry."""
+
+    def fake_fetch(_client: Any, token: str) -> list[dict[str, Any]]:
+        if token == "tok-bad":
+            raise RuntimeError("plaid down")
+        return [{"name": "Good Card", "balance": 10.0, "minimum_payment": 5.0, "apr": 2.0}]
+
+    with (
+        patch.object(snowball_sync.Config, "GCP_PROJECT_ID", "proj-1"),
+        patch.object(snowball_sync, "_build_plaid_client"),
+        patch.object(
+            snowball_sync,
+            "_list_all_token_secret_ids",
+            return_value=["plaid-access-token-chase-1", "plaid-access-token-amex-2"],
+        ),
+        patch.object(
+            snowball_sync,
+            "get_secret",
+            side_effect=lambda _p, s: "tok-bad" if "amex" in s else "tok-ok",
+        ),
+        patch.object(snowball_sync, "fetch_liabilities", side_effect=fake_fetch),
+    ):
+        accounts = snowball_sync.collect_accounts_for_dry_run()
+
+    by_inst = {a["institution"]: a for a in accounts}
+    assert by_inst["Chase"]["name"] == "Good Card"
+    assert by_inst["Chase"]["secret_id"] == "plaid-access-token-chase-1"
+    assert by_inst["amex-2"]["error"]
+    assert by_inst["amex-2"]["name"] == ""
+
+
+def test_collect_accounts_for_dry_run_requires_project_id() -> None:
+    """The discovery collector fails fast without GCP_PROJECT_ID."""
+    with patch.object(snowball_sync.Config, "GCP_PROJECT_ID", ""):
+        with pytest.raises(snowball_sync.SnowballSyncError):
+            snowball_sync.collect_accounts_for_dry_run()
+
+
+def test_format_dry_run_report_renders_sections() -> None:
+    """The report shows per-account lines, match status, and the summary tail."""
+    summary = {
+        "accounts_fetched": 2,
+        "would_update": ["My Chase Again"],
+        "unmapped": ["Mystery Card"],
+        "plan": [
+            {
+                "institution": "Chase",
+                "name": "Chase Card",
+                "balance": 1000.0,
+                "minimum_payment": 50.0,
+                "apr": 19.49,
+                "error": None,
+                "creditor": "My Chase Again",
+                "row": 8,
+                "status": "matched",
+            },
+            {
+                "institution": "amex-1",
+                "name": "Mystery Card",
+                "balance": 5.0,
+                "minimum_payment": None,
+                "apr": None,
+                "error": None,
+                "creditor": None,
+                "row": None,
+                "status": "unmapped",
+            },
+        ],
+    }
+
+    report = snowball_sync._format_dry_run_report(summary)
+
+    assert "DRY RUN" in report
+    assert "[Chase] Chase Card" in report
+    assert "row 8" in report
+    assert "apr=19.49%" in report
+    assert "minimum=n/a" in report
+    assert "UNMAPPED" in report
+    assert "Mystery Card" in report
+
+
+def test_main_defaults_to_dry_run(capsys: pytest.CaptureFixture[str]) -> None:
+    """The CLI runs a dry-run by default and prints the report."""
+    fake = {"accounts_fetched": 0, "would_update": [], "unmapped": [], "plan": []}
+    with patch.object(snowball_sync, "run_sync", return_value=fake) as mock_run:
+        snowball_sync.main([])
+
+    mock_run.assert_called_once_with(dry_run=True, all_tokens=False)
+    assert "DRY RUN" in capsys.readouterr().out
+
+
+def test_main_all_tokens_flag_passes_through(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--all-tokens is forwarded to run_sync's discovery mode."""
+    fake = {"accounts_fetched": 0, "would_update": [], "unmapped": [], "plan": []}
+    with patch.object(snowball_sync, "run_sync", return_value=fake) as mock_run:
+        snowball_sync.main(["--all-tokens"])
+
+    mock_run.assert_called_once_with(dry_run=True, all_tokens=True)
+
+
+def test_main_write_flag_runs_real_sync(capsys: pytest.CaptureFixture[str]) -> None:
+    """--write performs a real sync (no dry-run) and prints the JSON summary."""
+    with patch.object(
+        snowball_sync, "run_sync", return_value={"rows_updated": 1}
+    ) as mock_run:
+        snowball_sync.main(["--write"])
+
+    mock_run.assert_called_once_with()
+    assert "rows_updated" in capsys.readouterr().out

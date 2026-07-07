@@ -35,6 +35,7 @@ not a stored key — share the spreadsheet with the runtime service account.
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 from datetime import datetime, timezone
@@ -215,7 +216,94 @@ def collect_plaid_accounts() -> list[dict[str, Any]]:
                     "account_count": len(item_accounts),
                 },
             )
+            for account in item_accounts:
+                account["institution"] = institution
+                account["secret_id"] = secret_id
             accounts.extend(item_accounts)
+
+    return accounts
+
+
+def _list_all_token_secret_ids(project_id: str) -> list[str]:
+    """Return every ``plaid-access-token-*`` secret id in the project.
+
+    Unlike :func:`_list_token_secret_ids` (which is scoped to a single
+    configured institution prefix), this lists tokens for *all* connected
+    institutions — including any not yet wired into
+    :data:`INSTITUTION_SECRET_PREFIXES`. Used by the dry-run's ``--all-tokens``
+    discovery mode so newly-connected institutions surface before the sync map
+    is updated.
+    """
+    from google.cloud import secretmanager  # imported here to avoid top-level cost
+
+    prefix = "plaid-access-token-"
+    client = secretmanager.SecretManagerServiceClient()
+    parent = f"projects/{project_id}"
+    ids: list[str] = []
+    for secret in client.list_secrets(request={"parent": parent, "filter": f"name:{prefix}"}):
+        short = secret.name.rsplit("/", 1)[-1]
+        if short.startswith(prefix):
+            ids.append(short)
+    return sorted(ids)
+
+
+def _institution_for_secret(secret_id: str) -> str:
+    """Best-effort institution display name for a token *secret_id*.
+
+    Returns the configured display name when the secret matches a known prefix,
+    otherwise the raw slug portion of the secret id (so unconfigured
+    institutions are still labelled in the dry-run report).
+    """
+    for institution, prefix in INSTITUTION_SECRET_PREFIXES.items():
+        if secret_id == prefix or secret_id.startswith(f"{prefix}-"):
+            return institution
+    prefix = "plaid-access-token-"
+    return secret_id[len(prefix):] if secret_id.startswith(prefix) else secret_id
+
+
+def collect_accounts_for_dry_run() -> list[dict[str, Any]]:
+    """Gather accounts across EVERY connected token, for dry-run reporting only.
+
+    Reads every ``plaid-access-token-*`` secret (not just configured
+    institutions) so the dry-run can show all connected institutions. A failed
+    fetch is recorded as an ``error`` marker entry rather than skipped, so the
+    report still shows that the institution was reached but errored.
+
+    Raises:
+        SnowballSyncError: If ``GCP_PROJECT_ID`` is not configured.
+    """
+    project_id = Config.GCP_PROJECT_ID
+    if not project_id:
+        raise SnowballSyncError("GCP_PROJECT_ID must be set to fetch Plaid credentials")
+
+    client = _build_plaid_client()
+    accounts: list[dict[str, Any]] = []
+    for secret_id in _list_all_token_secret_ids(project_id):
+        institution = _institution_for_secret(secret_id)
+        try:
+            access_token = get_secret(project_id, secret_id)
+            item_accounts = fetch_liabilities(client, access_token)
+        except Exception as exc:  # noqa: BLE001 - record the failure, keep going
+            logger.exception(
+                "dry-run: failed to fetch liabilities; recording error",
+                extra={"institution": institution, "secret_id": secret_id},
+            )
+            accounts.append(
+                {
+                    "institution": institution,
+                    "secret_id": secret_id,
+                    "name": "",
+                    "balance": None,
+                    "minimum_payment": None,
+                    "apr": None,
+                    "error": str(exc) or exc.__class__.__name__,
+                }
+            )
+            continue
+        for account in item_accounts:
+            account["institution"] = institution
+            account["secret_id"] = secret_id
+            accounts.append(account)
 
     return accounts
 
@@ -310,6 +398,63 @@ def _find_creditor_row(
     return None
 
 
+def plan_updates(
+    rows: list[list[str]], accounts: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Compute, read-only, how each Plaid account maps onto the sheet.
+
+    This is the shared, side-effect-free matching core used by both
+    :func:`update_snowball_sheet` (which then writes the matched rows) and the
+    dry-run report (which writes nothing). It performs no sheet mutation.
+
+    Args:
+        rows: All worksheet values (``worksheet.get_all_values()``).
+        accounts: Normalized Plaid account dicts (see :func:`fetch_liabilities`),
+            optionally carrying ``institution``/``secret_id``/``error`` keys.
+
+    Returns:
+        One result dict per account with keys ``institution``, ``secret_id``,
+        ``name``, ``balance``, ``minimum_payment``, ``apr``, ``error``,
+        ``creditor`` (mapped sheet name or ``None``), ``row`` (1-based or
+        ``None``), and ``status`` — one of ``"matched"``, ``"unmapped"``,
+        ``"row_not_found"``, or ``"error"``.
+    """
+    columns = _locate_layout(rows)
+    section_start = _find_section_start(rows)
+    creditor_col = columns[CREDITOR_HEADER]
+
+    results: list[dict[str, Any]] = []
+    for account in accounts:
+        name = account.get("name", "")
+        error = account.get("error")
+        creditor = PLAID_TO_SHEET_ROW_MAP.get(name)
+        row_num: int | None = None
+
+        if error:
+            status = "error"
+        elif creditor is None:
+            status = "unmapped"
+        else:
+            row_num = _find_creditor_row(rows, section_start, creditor_col, creditor)
+            status = "matched" if row_num is not None else "row_not_found"
+
+        results.append(
+            {
+                "institution": account.get("institution"),
+                "secret_id": account.get("secret_id"),
+                "name": name,
+                "balance": account.get("balance"),
+                "minimum_payment": account.get("minimum_payment"),
+                "apr": account.get("apr"),
+                "error": error,
+                "creditor": creditor,
+                "row": row_num,
+                "status": status,
+            }
+        )
+    return results
+
+
 def update_snowball_sheet(
     worksheet: Any,
     accounts: list[dict[str, Any]],
@@ -335,41 +480,26 @@ def update_snowball_sheet(
 
     rows = worksheet.get_all_values()
     columns = _locate_layout(rows)
-    section_start = _find_section_start(rows)
-    creditor_col = columns[CREDITOR_HEADER]
+    plans = plan_updates(rows, accounts)
 
     updated: list[str] = []
-    for account in accounts:
-        plaid_name = account.get("name", "")
-        # Debug line the user reads after the first run to fill in the row map.
-        logger.debug(
-            "Encountered Plaid account",
-            extra={
-                "plaid_account_name": plaid_name,
-                "balance": account.get("balance"),
-                "minimum_payment": account.get("minimum_payment"),
-                "apr": account.get("apr"),
-            },
-        )
-
-        creditor = PLAID_TO_SHEET_ROW_MAP.get(plaid_name)
-        if creditor is None:
+    for plan in plans:
+        if plan["status"] == "unmapped":
             logger.warning(
                 "Plaid account has no row mapping; skipping (update PLAID_TO_SHEET_ROW_MAP)",
-                extra={"plaid_account_name": plaid_name},
+                extra={"plaid_account_name": plan["name"]},
             )
             continue
-
-        row_num = _find_creditor_row(rows, section_start, creditor_col, creditor)
-        if row_num is None:
+        if plan["status"] == "row_not_found":
             logger.warning(
                 "Mapped creditor not found in section; skipping",
-                extra={"plaid_account_name": plaid_name, "creditor": creditor},
+                extra={"plaid_account_name": plan["name"], "creditor": plan["creditor"]},
             )
             continue
 
-        worksheet.update_cell(row_num, columns[AMOUNT_OWED_HEADER], account.get("balance"))
-        minimum = account.get("minimum_payment")
+        row_num = plan["row"]
+        worksheet.update_cell(row_num, columns[AMOUNT_OWED_HEADER], plan["balance"])
+        minimum = plan["minimum_payment"]
         # Treat a missing OR zero minimum as "no data" — Plaid reports 0 for some
         # cards, and writing it would clobber a real minimum kept in the sheet.
         if MIN_PAYMENT_HEADER in columns and minimum:
@@ -377,10 +507,10 @@ def update_snowball_sheet(
         if UPDATED_HEADER in columns:
             worksheet.update_cell(row_num, columns[UPDATED_HEADER], stamp)
 
-        updated.append(creditor)
+        updated.append(plan["creditor"])
         logger.info(
             "Updated snowball row",
-            extra={"creditor": creditor, "row": row_num, "balance": account.get("balance")},
+            extra={"creditor": plan["creditor"], "row": row_num, "balance": plan["balance"]},
         )
 
     logger.info("Snowball sync complete", extra={"rows_updated": len(updated)})
@@ -393,12 +523,39 @@ def _open_worksheet() -> Any:
     return client.open_by_key(SPREADSHEET_ID).worksheet(WORKSHEET_NAME)
 
 
-def run_sync() -> dict[str, Any]:
-    """Run the full sync: fetch Plaid liabilities and update the sheet.
+def run_sync(*, dry_run: bool = False, all_tokens: bool = False) -> dict[str, Any]:
+    """Run the sync: fetch Plaid liabilities and (unless dry-run) update the sheet.
+
+    Args:
+        dry_run: When True, compute and return the plan **without writing** any
+            cells. The sheet is still read (to resolve row matches).
+        all_tokens: Dry-run only. When True, read every ``plaid-access-token-*``
+            secret (all connected institutions) rather than just the configured
+            ``INSTITUTION_SECRET_PREFIXES``. Ignored when ``dry_run`` is False.
 
     Returns:
-        A summary dict with the number of accounts fetched and rows updated.
+        For a real run, a summary of ``accounts_fetched``/``rows_updated``.
+        For a dry-run, the full read-only ``plan`` plus ``would_update`` and
+        ``unmapped`` breakdowns. No cell is written in dry-run mode.
     """
+    if dry_run:
+        accounts = collect_accounts_for_dry_run() if all_tokens else collect_plaid_accounts()
+        worksheet = _open_worksheet()
+        rows = worksheet.get_all_values()
+        plans = plan_updates(rows, accounts)
+        summary = {
+            "dry_run": True,
+            "accounts_fetched": len(accounts),
+            "would_update": [p["creditor"] for p in plans if p["status"] == "matched"],
+            "unmapped": [p["name"] for p in plans if p["status"] == "unmapped"],
+            "plan": plans,
+        }
+        logger.info(
+            "run_sync dry-run finished",
+            extra={"accounts_fetched": len(accounts), "would_update": summary["would_update"]},
+        )
+        return summary
+
     accounts = collect_plaid_accounts()
     worksheet = _open_worksheet()
     updated = update_snowball_sheet(worksheet, accounts)
@@ -409,6 +566,84 @@ def run_sync() -> dict[str, Any]:
     }
     logger.info("run_sync finished", extra=summary)
     return summary
+
+
+def _fmt(value: Any, prefix: str = "") -> str:
+    """Format an optional numeric cell for the report ('n/a' when missing)."""
+    return f"{prefix}{value}" if value is not None else "n/a"
+
+
+def _format_dry_run_report(summary: dict[str, Any]) -> str:
+    """Render a dry-run summary as a human-readable, per-account report."""
+    plans: list[dict[str, Any]] = summary.get("plan", [])
+    status_label = {
+        "matched": "-> row {row} ({creditor})",
+        "unmapped": "UNMAPPED (no PLAID_TO_SHEET_ROW_MAP entry)",
+        "row_not_found": "MAPPED to {creditor!r} but no such row below the banner",
+        "error": "ERROR: {error}",
+    }
+
+    lines = [
+        "SNOWBALL SYNC - DRY RUN (no cells written)",
+        f"Accounts fetched: {summary.get('accounts_fetched', 0)}",
+        "",
+    ]
+    for plan in plans:
+        institution = plan.get("institution") or "?"
+        name = plan.get("name") or "(unnamed)"
+        apr = plan.get("apr")
+        lines.append(f"[{institution}] {name}")
+        lines.append(
+            f"    balance={_fmt(plan.get('balance'), '$')}  "
+            f"minimum={_fmt(plan.get('minimum_payment'), '$')}  "
+            f"apr={f'{apr}%' if apr is not None else 'n/a'}"
+        )
+        lines.append("    match:  " + status_label[plan["status"]].format(**plan))
+        lines.append("")
+
+    would = summary.get("would_update", [])
+    unmapped = summary.get("unmapped", [])
+    lines.append(f"Would update {len(would)} row(s): {would or '-'}")
+    lines.append(f"Unmapped account(s): {unmapped or '-'}")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """CLI for a **read-only** dry-run of the snowball sync.
+
+    Defaults to dry-run so it never writes by accident; pass ``--write`` to run
+    a real sync. Requires the same credentials as the deployed function (GCP ADC
+    for Sheets + Secret Manager, and Plaid secrets).
+    """
+    parser = argparse.ArgumentParser(
+        description="Dry-run (default) or apply the snowball sheet sync from "
+        "live Plaid liabilities. Dry-run writes nothing.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Explicitly request a dry-run (this is already the default).",
+    )
+    parser.add_argument(
+        "--write",
+        action="store_true",
+        help="Actually write to the sheet. Default is a dry-run (writes nothing).",
+    )
+    parser.add_argument(
+        "--all-tokens",
+        action="store_true",
+        help="Dry-run over EVERY plaid-access-token-* secret (all connected "
+        "institutions), not just the configured INSTITUTION_SECRET_PREFIXES.",
+    )
+    args = parser.parse_args(argv)
+
+    if args.write:
+        summary = run_sync()
+        print(json.dumps(summary, indent=2, default=str))
+        return
+
+    summary = run_sync(dry_run=True, all_tokens=args.all_tokens)
+    print(_format_dry_run_report(summary))
 
 
 @functions_framework.http
@@ -437,3 +672,7 @@ def sync_snowball_sheet_scheduled(event: Any, context: Any) -> None:
         context: The event metadata (unused).
     """
     run_sync()
+
+
+if __name__ == "__main__":
+    main()
