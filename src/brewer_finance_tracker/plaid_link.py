@@ -17,12 +17,16 @@ The Plaid environment is derived from the ``ENVIRONMENT`` config value:
 from __future__ import annotations
 
 import logging
+import re
 
 import plaid
 from plaid.api import plaid_api
 from plaid.api_client import ApiClient
 from plaid.configuration import Configuration
+from plaid.model.accounts_get_request import AccountsGetRequest
 from plaid.model.country_code import CountryCode
+from plaid.model.institutions_get_by_id_request import InstitutionsGetByIdRequest
+from plaid.model.item_get_request import ItemGetRequest
 from plaid.model.item_public_token_exchange_request import (
     ItemPublicTokenExchangeRequest,
 )
@@ -34,6 +38,12 @@ from .config import Config
 from .secrets.manager import get_secret
 
 logger = logging.getLogger(__name__)
+
+#: Secret Manager id prefix for stored Plaid access tokens. Must stay in sync
+#: with the standalone setup tool (``tools/plaid-link-setup/server.py``) and the
+#: reader (``snowball_sync.py``) so tokens are named identically no matter which
+#: flow connected them: ``plaid-access-token-{slug}-{disambiguator}``.
+SECRET_PREFIX = "plaid-access-token-"
 
 _PLAID_ENV_MAP: dict[str, str] = {
     "production": plaid.Environment.Production,
@@ -100,19 +110,23 @@ def create_link_token(user_id: str) -> str:
     return str(response["link_token"])
 
 
-def exchange_public_token(public_token: str, item_label: str) -> str:
+def exchange_public_token(
+    public_token: str, institution_name: str | None = None
+) -> str:
     """Exchange a Plaid Link public token for a permanent access token.
 
     The resulting access token is stored in Secret Manager under the key
-    ``plaid-access-token-{item_label}`` so that it survives service restarts
-    without ever appearing in logs, environment variables, or source code.
+    ``plaid-access-token-{slug}-{disambiguator}`` — the institution name
+    slugified, plus a per-Item disambiguator (the first account's last-4, or an
+    ``item_id`` suffix when no mask is available). This matches the standalone
+    setup tool's naming exactly, so connecting a second card at the same
+    institution never overwrites the first regardless of which flow was used.
 
     Args:
-        public_token: The temporary token returned by Plaid Link on the client
-                      after the user successfully connects their account.
-        item_label:   A short, URL-safe label identifying this Plaid Item
-                      (e.g. ``"chase-checking"``).  Used as the Secret Manager
-                      key suffix.
+        public_token:     The temporary token returned by Plaid Link on the
+                          client after the user successfully connects an account.
+        institution_name: The connected institution's display name. If omitted,
+                          it is resolved from the item via the Plaid API.
 
     Returns:
         The permanent Plaid access token string.
@@ -127,28 +141,90 @@ def exchange_public_token(public_token: str, item_label: str) -> str:
     access_token: str = response["access_token"]
     item_id: str = response["item_id"]
 
-    _store_access_token(access_token, item_label)
+    if not institution_name:
+        institution_name = _lookup_institution_name(client, access_token)
+
+    slug = _slugify(institution_name)
+    disambiguator = _slugify(_account_disambiguator(client, access_token, item_id))
+    secret_id = f"{SECRET_PREFIX}{slug}-{disambiguator}"
+
+    _store_access_token(access_token, secret_id)
 
     logger.info(
         "Exchanged Plaid public token and stored access token",
-        extra={"item_id": item_id, "item_label": item_label},
+        extra={"item_id": item_id, "secret_id": secret_id},
     )
     return access_token
 
 
-def _store_access_token(access_token: str, item_label: str) -> None:
-    """Persist *access_token* to Secret Manager.
+def _slugify(name: str) -> str:
+    """Turn an institution name into a Secret-Manager-safe slug.
+
+    Secret ids may contain only letters, digits, hyphens and underscores.
+    e.g. ``"Chase Bank, N.A."`` -> ``"chase-bank-n-a"``.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return slug or "unknown"
+
+
+def _model_get(obj: object, key: str) -> object | None:
+    """Safely read *key* from a Plaid model (or dict), returning None if absent."""
+    try:
+        value: object = obj[key]  # type: ignore[index]
+    except (KeyError, AttributeError, TypeError):
+        return None
+    return value
+
+
+def _account_disambiguator(
+    client: plaid_api.PlaidApi, access_token: str, item_id: str
+) -> str:
+    """Return a per-Item disambiguator for the secret name.
+
+    Prefers the last-4 (mask) of the first account on the Item; if no mask is
+    available at exchange time, falls back to a suffix of the ``item_id`` (which
+    is stable and unique per Item). This keeps each Item's token in its own
+    Secret Manager secret so a second card at the same institution never
+    overwrites the first.
+    """
+    try:
+        response = client.accounts_get(AccountsGetRequest(access_token=access_token))
+        for account in response["accounts"]:
+            mask = _model_get(account, "mask")
+            if mask:
+                return str(mask)
+    except plaid.ApiException:
+        pass
+    return item_id[-8:]
+
+
+def _lookup_institution_name(client: plaid_api.PlaidApi, access_token: str) -> str:
+    """Resolve an institution's display name from an access token."""
+    item = client.item_get(ItemGetRequest(access_token=access_token))
+    institution_id = item["item"]["institution_id"]
+    if not institution_id:
+        return "unknown"
+    details = client.institutions_get_by_id(
+        InstitutionsGetByIdRequest(
+            institution_id=institution_id,
+            country_codes=[CountryCode("US")],
+        )
+    )
+    return str(details["institution"]["name"])
+
+
+def _store_access_token(access_token: str, secret_id: str) -> None:
+    """Persist *access_token* to Secret Manager under *secret_id*.
 
     Creates the secret if it does not exist, then adds a new version.
 
     Args:
         access_token: Plaid access token to store.
-        item_label:   Label used to construct the secret resource name.
+        secret_id:    Fully-formed Secret Manager secret id to store it under.
     """
     from google.cloud import secretmanager  # imported here to avoid top-level cost
 
     project_id = Config.GCP_PROJECT_ID
-    secret_id = f"plaid-access-token-{item_label}"
     parent = f"projects/{project_id}"
 
     sm_client = secretmanager.SecretManagerServiceClient()

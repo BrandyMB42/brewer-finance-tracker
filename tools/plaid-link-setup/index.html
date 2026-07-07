@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Brewer Finance Tracker — Account Setup</title>
+  <!-- Plaid Link drop-in module -->
+  <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --ok: #34d399;
+      --err: #f87171;
+      --border: #334155;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      justify-content: center;
+      padding: 40px 16px;
+    }
+    main { width: 100%; max-width: 640px; }
+    h1 { font-size: 1.5rem; margin: 0 0 4px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+      margin-bottom: 20px;
+    }
+    p.lead { color: var(--muted); margin-top: 0; line-height: 1.5; }
+    .badge {
+      display: inline-block;
+      font-size: 0.75rem;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      margin-left: 8px;
+      vertical-align: middle;
+    }
+    button {
+      background: var(--accent);
+      color: #082f49;
+      font-weight: 600;
+      font-size: 1rem;
+      border: 0;
+      border-radius: 8px;
+      padding: 12px 20px;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .status { margin-top: 16px; padding: 14px 16px; border-radius: 8px; display: none; }
+    .status.show { display: block; }
+    .status.ok { background: rgba(52, 211, 153, 0.12); border: 1px solid var(--ok); color: var(--ok); }
+    .status.err { background: rgba(248, 113, 113, 0.12); border: 1px solid var(--err); color: var(--err); }
+    .status.info { background: rgba(56, 189, 248, 0.10); border: 1px solid var(--accent); color: var(--accent); }
+    ul#connected { list-style: none; padding: 0; margin: 8px 0 0; }
+    ul#connected li {
+      padding: 8px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+    code { background: #0b1220; padding: 1px 6px; border-radius: 4px; font-size: 0.85em; }
+    .muted-small { color: var(--muted); font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="card">
+      <h1>Account Connection Setup <span id="env-badge" class="badge">checking…</span></h1>
+      <p class="lead">
+        This is a one-time tool for connecting the family bank accounts through
+        Plaid Link. It runs entirely on this machine and is never deployed. When
+        you connect an institution, its access token is stored securely in GCP
+        Secret Manager so the tracker can read transactions going forward.
+      </p>
+      <button id="connect-btn" disabled>Connect a bank account</button>
+      <div id="status" class="status"></div>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:1.1rem;margin-top:0;">Already connected</h2>
+      <p class="muted-small" id="connected-empty">Loading connected institutions…</p>
+      <ul id="connected"></ul>
+    </div>
+  </main>
+
+  <script>
+    const API = "http://localhost:5000";
+    const connectBtn = document.getElementById("connect-btn");
+    const statusEl = document.getElementById("status");
+    const envBadge = document.getElementById("env-badge");
+    const connectedList = document.getElementById("connected");
+    const connectedEmpty = document.getElementById("connected-empty");
+
+    function setStatus(kind, html) {
+      statusEl.className = "status show " + kind;
+      statusEl.innerHTML = html;
+    }
+
+    async function refreshStatus() {
+      try {
+        const res = await fetch(`${API}/status`);
+        if (!res.ok) throw new Error(`status ${res.status}`);
+        const data = await res.json();
+        envBadge.textContent = data.plaid_env + " mode";
+        renderConnected(data.connected || []);
+      } catch (err) {
+        envBadge.textContent = "server offline";
+        connectedEmpty.textContent =
+          "Could not reach the local server at " + API +
+          ". Start it with `python server.py`.";
+      }
+    }
+
+    function renderConnected(slugs) {
+      connectedList.innerHTML = "";
+      if (!slugs.length) {
+        connectedEmpty.style.display = "block";
+        connectedEmpty.textContent = "No institutions connected yet.";
+        return;
+      }
+      connectedEmpty.style.display = "none";
+      for (const slug of slugs) {
+        const li = document.createElement("li");
+        li.innerHTML = `<span class="dot"></span><span>${slug}</span>`;
+        connectedList.appendChild(li);
+      }
+    }
+
+    async function startLink() {
+      setStatus("info", "Requesting a Plaid Link token…");
+      let linkToken;
+      try {
+        const res = await fetch(`${API}/create-link-token`, { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || data.error || "request failed");
+        linkToken = data.link_token;
+      } catch (err) {
+        setStatus("err", "Failed to create a Link token: " + err.message +
+          "<br/><span class='muted-small'>Is the local server running and are your .env credentials correct?</span>");
+        return;
+      }
+
+      const handler = Plaid.create({
+        token: linkToken,
+        onSuccess: async (public_token, metadata) => {
+          const institution = metadata && metadata.institution ? metadata.institution : {};
+          setStatus("info", `Connecting ${institution.name || "your institution"}…`);
+          try {
+            const res = await fetch(`${API}/exchange-token`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ public_token, institution }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || data.error || "exchange failed");
+            setStatus("ok",
+              `✅ Connected <strong>${data.institution_name}</strong>.<br/>` +
+              `<span class='muted-small'>item_id: <code>${data.item_id}</code> · ` +
+              `secret: <code>${data.secret_id}</code></span>`);
+            refreshStatus();
+          } catch (err) {
+            setStatus("err", "Token exchange failed: " + err.message);
+          }
+        },
+        onExit: (err) => {
+          if (err) {
+            setStatus("err", "Plaid Link closed with an error: " +
+              (err.display_message || err.error_message || err.error_code || "unknown"));
+          }
+        },
+      });
+      handler.open();
+    }
+
+    connectBtn.addEventListener("click", startLink);
+
+    // On load: confirm the server is reachable and enable the button.
+    (async function init() {
+      await refreshStatus();
+      if (envBadge.textContent !== "server offline") {
+        connectBtn.disabled = false;
+      }
+    })();
+  </script>
+</body>
+</html>

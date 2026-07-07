@@ -219,3 +219,8 @@ __marimo__/
 
 # Helm chart dependency build artifacts (resolved subchart tarballs)
 kubernetes/**/charts/
+
+# Local-only setup utilities (see tools/README.md). The directory is ignored
+# so local artifacts (.env, caches, downloaded data) never get tracked; the
+# tool source is committed once with `git add -f`.
+tools/
